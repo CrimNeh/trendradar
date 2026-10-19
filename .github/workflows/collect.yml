@@ -1,0 +1,86 @@
+name: collect
+
+# Every 15 min. GitHub's floor is 5 min and runs can be delayed under load,
+# so 15 is the practical granularity. Free on public repos.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -q -r requirements.txt
+
+      # The embedding model (~120 MB) is cached so it downloads once, not on
+      # every 15-minute run.
+      - name: Cache embedding model
+        uses: actions/cache@v4
+        with:
+          path: data/models
+          key: emb-model-v1
+
+      # Actions cache is the free way to persist the DB. For durability move
+      # to Postgres (Neon/Supabase free tier) and set TRENDRADAR_DB in secrets.
+      - name: Restore DB
+        uses: actions/cache/restore@v4
+        with:
+          path: data/trendradar.db
+          key: db-${{ github.run_id }}
+          restore-keys: db-
+
+      - name: Collect Roblox
+        run: python src/collect.py
+
+      # RSS polling is cheap (~90 requests, 15s) so it runs every tick.
+      # Link + token matching run every tick. The semantic pass loads a model
+      # and embeds every unmatched title, so it runs once an hour.
+      - name: Collect YouTube
+        run: |
+          if [ "$(date +%M)" -lt 15 ]; then
+            python src/youtube_collect.py
+          else
+            python src/youtube_collect.py --no-embed
+          fi
+
+      # External sources change slowly. Steam is ~40 throttled requests, so
+      # every 15 min would be wasteful and rate-limit prone. Anime and
+      # DevForum update on a daily cadence anyway.
+      - name: Collect origins (hourly)
+        run: |
+          if [ "$(date +%M)" -lt 15 ]; then
+            python src/origins.py
+          fi
+
+      - name: Report
+        run: python src/report.py
+
+      - name: Save DB
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: data/trendradar.db
+          key: db-${{ github.run_id }}
+
+      - name: Keep artifact copy (7 days)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: db-${{ github.run_id }}
+          path: |
+            data/trendradar.db
+            reports/
+          retention-days: 7

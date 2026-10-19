@@ -1,0 +1,7 @@
+requests>=2.32
+SQLAlchemy>=2.0
+pandas>=2.2
+numpy>=1.26
+streamlit>=1.40
+plotly>=5.24
+fastembed>=0.4
