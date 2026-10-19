@@ -1,7 +1,7 @@
 name: collect
 
-# Every 15 min. GitHub's floor is 5 min and runs can be delayed under load,
-# so 15 is the practical granularity. Free on public repos.
+# Every 15 min. GitHub's floor is 5 min and runs can be delayed under load, so
+# 15 is the practical granularity. Free on public repos.
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -10,6 +10,14 @@ on:
 concurrency:
   group: collect
   cancel-in-progress: false
+
+env:
+  # Read once here instead of repeating it on every step. The database is
+  # Postgres (Neon free tier) so nothing is persisted through the Actions
+  # cache - the cache is evicted without warning and would silently reset the
+  # whole history.
+  TRENDRADAR_DB: ${{ secrets.TRENDRADAR_DB }}
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   snapshot:
@@ -25,27 +33,40 @@ jobs:
 
       - run: pip install -q -r requirements.txt
 
+      # Fail here, with a readable message, rather than deep inside a collector
+      # with a traceback nobody can act on.
+      - name: Check database secret
+        run: |
+          if [ -z "$TRENDRADAR_DB" ]; then
+            echo "::error::Secret TRENDRADAR_DB is not set."
+            echo "Settings -> Secrets and variables -> Actions -> New repository secret"
+            echo "Name: TRENDRADAR_DB   Value: postgresql://... (from neon.tech)"
+            exit 1
+          fi
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          url = os.environ["TRENDRADAR_DB"]
+          e = create_engine(url.replace("postgresql://", "postgresql+psycopg2://", 1))
+          with e.connect() as c:
+              c.execute(text("select 1"))
+          print("database reachable")
+          PY
+
       # The embedding model (~120 MB) is cached so it downloads once, not on
-      # every 15-minute run.
+      # every run. This cache holds a model, not data, so eviction is harmless.
       - name: Cache embedding model
         uses: actions/cache@v4
         with:
           path: data/models
           key: emb-model-v1
 
-      # Actions cache is the free way to persist the DB. For durability move
-      # to Postgres (Neon/Supabase free tier) and set TRENDRADAR_DB in secrets.
-      - name: Restore DB
-        uses: actions/cache/restore@v4
-        with:
-          path: data/trendradar.db
-          key: db-${{ github.run_id }}
-          restore-keys: db-
+      - name: Create schema
+        run: python src/db.py
 
       - name: Collect Roblox
         run: python src/collect.py
 
-      # RSS polling is cheap (~90 requests, 15s) so it runs every tick.
       # Link + token matching run every tick. The semantic pass loads a model
       # and embeds every unmatched title, so it runs once an hour.
       - name: Collect YouTube
@@ -57,8 +78,7 @@ jobs:
           fi
 
       # External sources change slowly. Steam is ~40 throttled requests, so
-      # every 15 min would be wasteful and rate-limit prone. Anime and
-      # DevForum update on a daily cadence anyway.
+      # every 15 min would be wasteful and rate-limit prone.
       - name: Collect origins (hourly)
         run: |
           if [ "$(date +%M)" -lt 15 ]; then
@@ -68,19 +88,12 @@ jobs:
       - name: Report
         run: python src/report.py
 
-      - name: Save DB
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: data/trendradar.db
-          key: db-${{ github.run_id }}
-
-      - name: Keep artifact copy (7 days)
+      # Keep the markdown/CSV reports for 7 days. The database itself lives in
+      # Neon, so there is nothing to upload for it.
+      - name: Keep reports (7 days)
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: db-${{ github.run_id }}
-          path: |
-            data/trendradar.db
-            reports/
+          name: reports-${{ github.run_id }}
+          path: reports/
           retention-days: 7

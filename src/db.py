@@ -25,16 +25,36 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 # SQLite only auto-increments an INTEGER PRIMARY KEY, so use a portable type.
 PKType = BigInteger().with_variant(Integer, "sqlite")
 
-DB_URL = os.environ.get(
+def _normalise_url(url: str) -> str:
+    """Pin the Postgres driver.
+
+    SQLAlchemy 2.1 resolves a bare `postgresql://` to psycopg (v3), which is
+    not in requirements. We ship psycopg2, so say so explicitly - otherwise a
+    Neon URL from the dashboard fails with "No module named 'psycopg'".
+    """
+    if url.startswith("postgres://"):          # Heroku-style alias
+        url = "postgresql://" + url[len("postgres://"):]
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg2://" + url[len("postgresql://"):]
+    return url
+
+
+DB_URL = _normalise_url(os.environ.get(
     "TRENDRADAR_DB",
     "sqlite:///" + os.path.join(os.path.dirname(__file__), "..", "data", "trendradar.db"),
-)
+))
 
-engine = create_engine(
-    DB_URL,
-    future=True,
-    connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {},
-)
+_engine_kwargs: dict = {"future": True}
+if DB_URL.startswith("sqlite"):
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    # Neon (and other serverless Postgres) close idle connections. Without
+    # pre_ping the first query of each run hits a dead socket; without recycle
+    # a long run can hold a connection past the server's idle timeout.
+    _engine_kwargs.update(pool_pre_ping=True, pool_recycle=300, pool_size=5,
+                          max_overflow=5)
+
+engine = create_engine(DB_URL, **_engine_kwargs)
 Session = sessionmaker(bind=engine, future=True)
 Base = declarative_base()
 
