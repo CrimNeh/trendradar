@@ -5,6 +5,12 @@ name: collect
 on:
   schedule:
     - cron: "*/15 * * * *"
+  # Second trigger for an external pinger (cron-job.org). GitHub's own
+  # schedule is best-effort and skipped 80% of runs here; an outside clock
+  # fires on time. Send POST /repos/CrimNeh/trendradar/dispatches with
+  # {"event_type": "tick"} using a token that only has Actions: write.
+  repository_dispatch:
+    types: [tick]
   workflow_dispatch:
 
 concurrency:

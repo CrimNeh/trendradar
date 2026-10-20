@@ -33,6 +33,37 @@ def load():
 
 
 st.title("📡 TrendRadar — Roblox")
+
+
+def _freshness() -> None:
+    """Show when data was last written, in UTC, with age in minutes.
+
+    Neon's table view sorts by id, so a stale table can look fresh. This line
+    answers "is it collecting?" directly, without opening the database console.
+    """
+    try:
+        from datetime import datetime, timezone
+        from sqlalchemy import func
+        from db import Session as _S, Snapshot as _Snap
+        with _S() as _s:
+            last = _s.query(func.max(_Snap.ts)).scalar()
+    except Exception:
+        return
+    if last is None:
+        st.warning("В базе пока нет ни одного снимка.")
+        return
+    age_min = (datetime.now(timezone.utc).replace(tzinfo=None) - last).total_seconds() / 60
+    if age_min < 30:
+        st.success(f"Последнее обновление: {last:%H:%M} UTC ({age_min:.0f} мин назад)")
+    elif age_min < 120:
+        st.warning(f"Данные отстают: последнее обновление {last:%H:%M} UTC "
+                   f"({age_min:.0f} мин назад). GitHub задерживает запуски.")
+    else:
+        st.error(f"Сбор остановлен: последнее обновление {last:%d.%m %H:%M} UTC "
+                 f"({age_min/60:.1f} ч назад). Проверь Actions.")
+
+
+_freshness()
 f, summ, brief = load()
 
 if f.empty:
