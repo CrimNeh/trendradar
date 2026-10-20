@@ -227,11 +227,17 @@ def build_rows(f: pd.DataFrame, moves: pd.DataFrame,
 def why(row) -> str:
     """One line of plain reasoning, built from the numbers next to it."""
     bits = []
-    sc = row["share_change"]
-    if sc >= 1.5:
-        bits.append("доля рынка выросла в полтора раза")
-    elif sc >= 1.15:
-        bits.append("уверенно забирает долю у остальных")
+    # Wording follows `trend`, not `share_change`: trend is what orders the
+    # cards, so a sentence built from a different measure can make the 8th card
+    # read stronger than the 1st. Measured, they disagree on rank for 6 of 8.
+    tr = row.get("trend")
+    if tr is not None and not pd.isna(tr):
+        if tr >= 1.5:
+            bits.append("доля рынка растёт очень быстро")
+        elif tr >= 0.85:
+            bits.append("уверенно забирает долю у остальных")
+        elif tr >= 0.0:
+            bits.append("доля растёт, но умеренно")
 
     d = row.get("ccu_delta", 0) or 0
     if d > 0:

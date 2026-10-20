@@ -31,10 +31,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import timedelta
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -225,6 +227,34 @@ def digest_selection() -> pd.DataFrame:
     return rows[(rows["trend"] >= D.MOVE_THRESHOLD) & (rows["r2"] >= 0.25)]
 
 
+def _blend_confidence(availability, r2) -> float | None:
+    """Confidence = how much data backs this AND how well the trend fits.
+
+    features._confidence measures only the first half: how many growth windows
+    are present and how long the history is. Measured on live data it is
+    0.67 for 365 of 468 games - g_d3 is empty for every game until three days
+    of history exist, so `have` is always 2 and the score is constant. A
+    constant cannot calibrate anything: the calibration table would be a single
+    bucket, which is exactly the failure this column exists to detect.
+
+    r2 measures the other half - whether the fitted trend is real or noise -
+    and it does vary (0.28-0.45 across the current top eight). Neither alone
+    answers "should I trust this prediction", so the product does.
+
+    Scale: r2 below the 0.25 digest gate is treated as weak (0.4), a perfect
+    fit as 1.0. Multiplying keeps a well-fitted game with thin data from
+    outranking a well-evidenced one.
+    """
+    if availability is None or pd.isna(availability):
+        return None
+    avail = float(np.clip(availability, 0.0, 1.0))
+    if r2 is None or pd.isna(r2):
+        # No fit information: halve it rather than pretend the trend is solid.
+        return float(round(avail * 0.5, 2))
+    fit = float(np.clip((float(r2) - 0.25) / 0.75 * 0.6 + 0.4, 0.2, 1.0))
+    return float(round(avail * fit, 2))
+
+
 def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
     """Log what the digest actually showed, in the order it showed it.
 
@@ -261,7 +291,8 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
             "name": r["name"],
             "base": float(r["ccu_last"] or 0),
             "score": r.get("trend"),
-            "confidence": conf_by_uid.get(int(r["universe_id"])),
+            "confidence": _blend_confidence(
+                conf_by_uid.get(int(r["universe_id"])), r.get("r2")),
             "cohort_rank": r.get("cohort_rank"),
         } for r in rows.to_dict("records")]
     else:
@@ -288,7 +319,14 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
                 skipped += 1
                 continue
             base = c["base"]
-            if base <= 0:
+
+            # NaN needs its own check. `float(nan or 0)` returns nan (nan is
+            # truthy), and every comparison against nan is False - so a nan
+            # baseline passes `base <= 0` and later makes `_judge` fall through
+            # to "miss" with a basis of "nan%". A silent wrong outcome is worse
+            # than no row at all.
+            if base is None or (isinstance(base, float) and math.isnan(base)) \
+                    or base <= 0:
                 skipped += 1
                 continue
 
@@ -378,8 +416,12 @@ def _judge(criterion: str, base: float, now: float,
     `threshold_pp` is the frozen bar stored on the row. It is never recomputed
     here: a criterion whose bar can move is not a criterion.
     """
-    if base <= 0:
-        return "void", "baseline zero"
+    # nan slips past `base <= 0` because comparisons with nan are always False.
+    # Without this check a corrupt row scores as a miss instead of a void.
+    if base <= 0 or (isinstance(base, float) and math.isnan(base)):
+        return "void", "baseline zero или NaN"
+    if now is None or (isinstance(now, float) and math.isnan(now)):
+        return "void", "нет значения на дату проверки"
 
     change = (now - base) / base
 
