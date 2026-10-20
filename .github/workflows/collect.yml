@@ -16,9 +16,11 @@ on:
     types: [tick]
   workflow_dispatch:
 
-# The publish step commits docs/index.md back to the repo.
+# Pages is deployed by uploading an artifact, not by committing to the repo.
+# Committing was the source of every "failed to push" conflict: the bot and the
+# human both wrote docs/ in the same branch.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: collect
@@ -117,6 +119,11 @@ jobs:
       - name: Clone targets (who to copy)
         run: python src/clone_targets.py
 
+      # Presentation dashboard: who is gaining share, who is losing it, with
+      # YouTube evidence. Writes docs/index.html.
+      - name: Build HTML digest
+        run: python src/digest_html.py
+
       # Keep the markdown/CSV reports for 7 days. The database itself lives in
       # Neon, so there is nothing to upload for it.
       - name: Keep reports (7 days)
@@ -127,25 +134,39 @@ jobs:
           path: reports/
           retention-days: 7
 
-      # Artifacts expire in 7 days and arrive as a zip - no way to glance at the
-      # digest from a phone. This copies the newest digest to docs/ and pushes
-      # it, so GitHub Pages serves it as a page you can bookmark.
-      - name: Publish digest to Pages
-        if: always()
+  # Separate job because Pages deployment needs its own permissions and an
+  # environment. It consumes the artifact the snapshot job just built.
+  deploy:
+    needs: snapshot
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      # Re-run the digest against the live database. The snapshot job's copy is
+      # not shared between jobs, and the page must reflect the same run.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -q -r requirements.txt
+      - name: Build HTML digest
+        run: python src/digest_html.py
+        env:
+          TRENDRADAR_DB: ${{ secrets.TRENDRADAR_DB }}
+
+      - name: Add markdown copy
         run: |
-          latest=$(ls -t reports/*_opportunity.md 2>/dev/null | head -1)
-          if [ -z "$latest" ]; then
-            echo "no opportunity report generated - nothing to publish"
-            exit 0
-          fi
-          mkdir -p docs
-          cp "$latest" docs/index.md
-          git config user.name  "trendradar-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/index.md
-          if git diff --staged --quiet; then
-            echo "digest unchanged"
-          else
-            git commit -m "digest: $(basename "$latest")"
-            git push origin HEAD:main
-          fi
+          latest=$(ls -t reports/*_opportunity.md 2>/dev/null | head -1 || true)
+          if [ -n "$latest" ]; then cp "$latest" docs/opportunity.md; fi
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+      - id: deployment
+        uses: actions/deploy-pages@v4

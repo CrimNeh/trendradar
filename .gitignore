@@ -4,3 +4,7 @@ __pycache__/
 .env
 .venv/
 reports/*.csv
+
+# Built by the workflow and uploaded as a Pages artifact. Nothing here should
+# be committed - that is what caused the push conflicts.
+docs/
