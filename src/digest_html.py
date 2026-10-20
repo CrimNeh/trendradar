@@ -39,6 +39,11 @@ MIN_CCU = 500
 # Share change needed to call something "rising" or "falling".
 MOVE_THRESHOLD = 0.15
 
+# How many rising cards the page renders. predictions.py reads this so the
+# ledger records exactly what was shown - it previously wrote 10 while the page
+# rendered 8, which put two unevaluated games into the hit-rate sample.
+RISING_CARDS = 8
+
 
 def _esc(x) -> str:
     return html.escape(str(x if x is not None else ""))
@@ -399,7 +404,7 @@ def render(f: pd.DataFrame, piv: pd.DataFrame, med: pd.Series,
                 f'с рынком в тот же момент, поэтому суточный цикл не мешает, '
                 f'но устойчивость тренда станет видна через сутки.</div>')
 
-    rising_html = "".join(card(r, piv) for r in rising.head(8).to_dict("records")) \
+    rising_html = "".join(card(r, piv) for r in rising.head(RISING_CARDS).to_dict("records")) \
         if len(rising) else '<p class="empty">Нет игр, растущих быстрее рынка.</p>'
 
     fall_rows = "".join(

@@ -300,7 +300,19 @@ class Prediction(Base):
     # result is known, the target would drift toward whatever happened.
     metric = Column(String(32), nullable=False)             # ccu|favorites
     baseline = Column(Float, nullable=False)                # value when predicted
-    criterion = Column(String(24), nullable=False)          # up_20pct|up_10pct
+    # Market median at forecast time. Needed to grade a relative claim: "grew
+    # faster than the market" cannot be checked without knowing what the market
+    # did over the same window, and that history may be pruned later.
+    benchmark = Column(Float)
+    criterion = Column(String(24), nullable=False)          # up_20pct|beat_market_p75
+    # The concrete bar in percentage points, resolved once at creation.
+    #
+    # A criterion naming a percentile ("beat_market_p75") is not self-contained:
+    # the pp value it corresponds to depends on the data at the time. Resolving
+    # it at judgement time would let the bar move as the market changes, which
+    # is the one thing a fixed criterion exists to prevent. So the number is
+    # frozen here, next to the forecast it grades.
+    threshold_pp = Column(Float)
     horizon_days = Column(Integer, nullable=False)
 
     # The score that produced the forecast, so accuracy can be tied back to the

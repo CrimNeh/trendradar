@@ -121,7 +121,16 @@ def _value_at(sub: pd.DataFrame, col: str, days_ago: float, now: pd.Timestamp):
         return None
     target = now - timedelta(days=days_ago)
     delta = (sub["ts"] - target).abs()
-    tol = timedelta(days=max(days_ago * 0.5, 0.02))
+
+    # Tolerance was 50% of the window, which is far too loose. At 50% a
+    # "7-day" comparison accepted a 4-day-old snapshot (43% short) and a
+    # "1-day" comparison accepted a 13-hour-old one (46% short). Both were
+    # silently reported as d1/d7 growth.
+    #
+    # The bound is now max(3 h, 12% of window) - 3 h because sampling is
+    # every 3 hours so nothing closer is available, 12% because beyond that
+    # the window being measured is misdescribed by its own label.
+    tol = timedelta(hours=max(3.0, days_ago * 24 * 0.12))
     if delta.min() > tol:
         return None
     return sub.loc[delta.idxmin(), col]
@@ -133,6 +142,27 @@ def _span_hours(sub: pd.DataFrame, now) -> float:
         return 0.0
     oldest = sub["ts"].min()
     return max((now - oldest).total_seconds() / 3600, 0.0)
+
+
+def _value_at_with_span(sub: pd.DataFrame, col: str, days_ago: float,
+                        now: pd.Timestamp):
+    """Value nearest `days_ago` back, plus the actual hours between it and now.
+
+    The span is returned because the caller needs it to turn a difference into a
+    rate. Using the game's whole history instead of the matched window silently
+    rescales every rate by however much history happens to exist.
+    """
+    if sub.empty:
+        return None, None
+    target = now - timedelta(days=days_ago)
+    delta = (sub["ts"] - target).abs()
+    tol = timedelta(hours=max(3.0, days_ago * 24 * 0.12))
+    if delta.min() > tol:
+        return None, None
+    idx = delta.idxmin()
+    matched_ts = sub.loc[idx, "ts"]
+    hours = (now - matched_ts).total_seconds() / 3600
+    return sub.loc[idx, col], hours
 
 
 def _ratio(new, old, floor=30.0):
@@ -188,22 +218,27 @@ def build_features() -> pd.DataFrame:
         # come back", which is what an active audience looks like.
         fav_now = cur["favorites"] or 0
         up_now = cur["up_votes"] or 0
-        fav_prev = _value_at(sub, "favorites", H["h6"], now)
-        up_prev = _value_at(sub, "up_votes", H["h6"], now)
-        span = _span_hours(sub, now)
+        fav_prev, fav_span = _value_at_with_span(sub, "favorites", H["h6"], now)
+        up_prev, up_span = _value_at_with_span(sub, "up_votes", H["h6"], now)
 
-        if fav_prev is not None and not pd.isna(fav_prev) and span >= 1:
+        # The rate must divide by the window the gain was measured over, not by
+        # the game's whole history. The first version divided by total history
+        # span: on 23 hours of data that understated a 6-hour gain by ~3.8x, and
+        # games with longer histories were penalised against newer ones inside
+        # the same cohort percentile. Measured: most games had 20-24h of span
+        # against a 6h gain window, so the bias was uniform but real.
+        if fav_prev is not None and not pd.isna(fav_prev) and fav_span and fav_span >= 1:
             gained = fav_now - float(fav_prev)
             rec["fav_gain_6h"] = int(gained) if gained > 0 else 0
-            rec["fav_rate"] = round(max(gained, 0) / span, 1)
+            rec["fav_rate"] = round(max(gained, 0) / fav_span, 1)
         else:
             rec["fav_gain_6h"] = None
             rec["fav_rate"] = None
 
-        if up_prev is not None and not pd.isna(up_prev) and span >= 1:
+        if up_prev is not None and not pd.isna(up_prev) and up_span and up_span >= 1:
             gained = up_now - float(up_prev)
             rec["vote_gain_6h"] = int(gained) if gained > 0 else 0
-            rec["vote_rate"] = round(max(gained, 0) / span, 1)
+            rec["vote_rate"] = round(max(gained, 0) / up_span, 1)
         else:
             rec["vote_gain_6h"] = None
             rec["vote_rate"] = None
