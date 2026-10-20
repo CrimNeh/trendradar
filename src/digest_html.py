@@ -202,7 +202,12 @@ def build_rows(f: pd.DataFrame, moves: pd.DataFrame,
         return pd.DataFrame()
     m = moves.merge(
         f[["universe_id", "name", "niche", "age_days", "tags", "chart_count",
-           "best_rank", "rank_delta_d1", "history_hours"]],
+           "best_rank", "rank_delta_d1", "history_hours",
+           # Conversion signals. These exist for ~95% of games, against
+           # yt_videos at 5%, so they carry the "is it alive" question that the
+           # YouTube panel could never answer.
+           "fav_rate", "fav_gain_6h", "fav_per_visit", "r_fav_pct",
+           "r_favrate_pct", "vote_rate", "like_ratio", "cohort_rank"]],
         on="universe_id", how="inner")
     m = m[m["ccu_last"].fillna(0) >= MIN_CCU]
     m["yt"] = m["universe_id"].map(lambda u: yt.get(int(u), {}))
@@ -248,6 +253,23 @@ def why(row) -> str:
     if rd is not None and not pd.isna(rd) and abs(rd) >= 3:
         bits.append(f"в чартах {'+' if rd > 0 else ''}{int(rd)} позиций")
 
+    # Conversion. This replaces YouTube as the "is it alive" evidence: it is
+    # available for 95% of games against 5%, and it is a person choosing to
+    # come back rather than a view on a video.
+    fr = row.get("fav_rate")
+    if fr is not None and not pd.isna(fr) and fr >= 20:
+        bits.append(f"+{_fmt(fr)} в избранное за час — возвращаются")
+    elif fr is not None and not pd.isna(fr) and fr >= 3:
+        bits.append(f"+{_fmt(fr)} в избранное за час")
+
+    fv = row.get("fav_per_visit")
+    if fv is not None and not pd.isna(fv) and fv >= 0.04:
+        bits.append(f"конверсия в избранное {fv*100:.1f}% — высокая")
+
+    lr = row.get("like_ratio")
+    if lr is not None and not pd.isna(lr) and lr >= 0.92:
+        bits.append(f"лайков {lr*100:.0f}%")
+
     return "; ".join(bits) or "держится на месте"
 
 
@@ -273,6 +295,20 @@ def card(row, piv: pd.DataFrame) -> str:
     # The single strongest video is the most convincing evidence of life: a
     # count says "someone mentioned it", a title with a view number says people
     # actually watched.
+    # Conversion badge. cohort_rank is the age x size percentile, so "топ 6%"
+    # means this game converts better than 94% of games its own age and size -
+    # the only comparison that means anything here.
+    #
+    # Wording matters here. cohort_rank is "better than N% of peers", so 56 is
+    # the middle. The first version rendered that as "топ 44%", which reads like
+    # a top-half result when it is not - 100-cr inverts the meaning.
+    cr = row.get("cohort_rank")
+    conv_badge = ""
+    if cr is not None and not pd.isna(cr):
+        cls = "conv-hi" if cr >= 85 else ("conv-mid" if cr >= 55 else "conv-low")
+        conv_badge = (f'<span class="badge {cls}">конверсия лучше '
+                      f'{cr:.0f}% сверстников</span>')
+
     ytv = row.get("yt") or {}
     yt_top = ""
     if ytv.get("top_title"):
@@ -318,12 +354,14 @@ def card(row, piv: pd.DataFrame) -> str:
           <div><span class="k">Сейчас</span><span class="v">{_fmt(row['ccu_last'])}</span></div>
           <div><span class="k">Было</span><span class="v">{_fmt(row['ccu_first'])}</span></div>
           <div><span class="k">Изм.</span><span class="v {'pos' if (row['ccu_delta'] or 0) >= 0 else 'neg'}">{'+' if (row['ccu_delta'] or 0) >= 0 else ''}{_fmt(row['ccu_delta'])}</span></div>
+          <div><span class="k">В избранное/ч</span><span class="v pos">{_fmt(row.get('fav_rate')) if row.get('fav_rate') is not None and not pd.isna(row.get('fav_rate')) else '—'}</span></div>
         </div>
         {spark}
       </div>
       <div class="why">{_esc(why(row))}</div>
       <div class="badges">
         <span class="badge {conf_cls}">{conf_txt} · R² {r2:.2f}</span>
+        {conv_badge}
         {yt_html}
         {yt_top}
       </div>
@@ -531,6 +569,9 @@ h2 .cnt{{font-size:12px;color:var(--dim);font-weight:500;
 .badge.conf-hi{{background:rgba(63,185,80,.1);color:#6fdc7f;border:1px solid rgba(63,185,80,.22)}}
 .badge.conf-mid{{background:rgba(210,153,34,.1);color:#d29922;border:1px solid rgba(210,153,34,.22)}}
 .badge.conf-low{{background:var(--panel2);color:var(--dim)}}
+.badge.conv-hi{{background:rgba(88,166,255,.13);color:#7fb3f0;border:1px solid rgba(88,166,255,.28)}}
+.badge.conv-mid{{background:var(--panel2);color:#9fb0c7}}
+.badge.conv-low{{background:var(--panel2);color:var(--dim)}}
 
 table{{width:100%;border-collapse:collapse;font-size:12.5px;
   background:var(--panel);border-radius:11px;overflow:hidden;

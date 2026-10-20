@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -50,28 +51,46 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(__file__))
 import match as matcher  # noqa: E402
 import yt_api  # noqa: E402
+from sqlalchemy import text  # noqa: E402
 from db import Mention, Session, YtChannel, YtVideo, utcnow  # noqa: E402
 from youtube_collect import games_frame  # noqa: E402
 
-# One search costs 100. Four searches = 400 units, a safe daily slice.
-DEFAULT_BUDGET = 400
+# Budget in quota units, not queries. One search is 100.
+#
+# The plan is 8 game queries + 2 localized + 1 generic = 1,100 units, so the
+# default has to exceed that or plan() silently drops the game queries - the
+# ones that actually work - and keeps the generic ones. That inversion is the
+# whole reason this default is 1,200 rather than 400.
+#
+# Ran twice a day that is 2,200 units, 22% of the free daily quota. The
+# remainder covers the channel importer and manual runs.
+DEFAULT_BUDGET = 1200
 # Beyond this the results are old enough that RSS would have caught them.
 LOOKBACK_DAYS = 3
 
-# Generic discovery. Deliberately few: each one costs a full search.
-BASE_QUERIES = [
-    "new roblox game",
-    "roblox update today",
-]
+# One generic query, kept only because it occasionally surfaces a game that is
+# not in our carousels yet. Everything else is game-targeted.
+BASE_QUERIES = ["new roblox game"]
 
-# Localized. Some games trend in Brazil or Indonesia days before the English
-# market notices, so one query per major non-English market is worth its cost.
+# Localized generic. Cheap insurance for markets that move before English does.
 LOCALE_QUERIES = {
     "pt": "jogo novo roblox",
-    "es": "juego nuevo roblox",
     "id": "game roblox baru",
-    "ru": "новая игра роблокс",
 }
+
+# How many games to search per run, and which ones.
+#
+# The channel-based collector could only see videos by creators we already
+# tracked, and those creators title videos "i'm broke now" - 119 of 157
+# channels produced no match at all. Searching by GAME inverts the funnel: the
+# query itself contains the name, so a creator's vague title no longer matters.
+#
+# Cost is the constraint. One search is 100 units against a 10,000/day quota,
+# so this cannot run for all 450+ games. Priority goes to games that are
+# moving, because a game rising today is the one whose coverage is changing.
+TARGET_GAMES = 8
+# Below this there is no audience worth searching for.
+MIN_CCU_FOR_SEARCH = 2_000
 
 
 def _published_after() -> str:
@@ -92,32 +111,68 @@ def plan(queries: list[str], budget: int) -> list[str]:
     return out
 
 
-def _game_query(s: Session, limit: int = 2) -> list[str]:
-    """Queries built from games that moved in the last day.
+def _clean_name(raw: str) -> str:
+    """A real search phrase, not a title with emoji and update tags.
 
-    Searching for a game that is already rising finds the videos our token pass
-    rejected for being too vague ("this game is insane" with the name only in
-    the thumbnail). Those are exactly the videos worth having.
+    "[🎃 UPD 2.5] Sell Fries! [Anomaly]" has to become "Sell Fries". Searching
+    the raw string returns nothing because nobody types brackets.
     """
-    rows = s.execute(
-        __import__("sqlalchemy").text("""
-            select g.name from games g
-            join snapshots sn on sn.universe_id = g.universe_id
-            where sn.ts = (select max(ts) from snapshots)
-              and sn.chart_count > 0
-            order by sn.playing desc limit 40
-        """)).fetchall()
-    names = [r[0] for r in rows if r[0]]
-    # Strip emoji and tags so the query is a real phrase a human would type.
-    clean = []
-    for n in names:
-        t = "".join(c for c in n if c.isalnum() or c in " -!").strip()
-        t = " ".join(t.split())[:40]
-        if len(t) >= 4:
-            clean.append(t)
-        if len(clean) >= limit:
+    t = raw or ""
+    # Bracketed tags: [NEW], [🎃], [UPDATE 2.5], (BETA)
+    t = re.sub(r"[\[\](){}<>].*?[\](){}<>]", " ", t)
+    # Emoji and pictographs
+    t = "".join(c for c in t if not (0x1F000 <= ord(c) <= 0x1FAFF))
+    t = "".join(c for c in t if not (0x2600 <= ord(c) <= 0x27BF))
+    # Common update noise that survives the bracket pass
+    t = re.sub(r"\b(UPD|UPDATE|BETA|ALPHA|RELEASE|EVENT|SEASON|PART)\b",
+               " ", t, flags=re.I)
+    # Version numbers only: "V3", "2.5", "v2". A bare integer is part of the
+    # name - "99 Nights in the Forest" became "Nights in the Forest" until this
+    # was narrowed, and the search then returned nothing useful.
+    t = re.sub(r"\bv?\d+\.\d+\b", " ", t, flags=re.I)
+    t = re.sub(r"\bv\d+\b", " ", t, flags=re.I)
+    t = " ".join(t.split())
+    t = re.sub(r"[●•·|/\\&]+", " ", t)
+    return " ".join(t.split())[:48].strip(" -!|.,:;")
+
+
+def _target_games(s: Session, limit: int = TARGET_GAMES) -> list[dict]:
+    """Pick which games deserve a search this run.
+
+    Ranked by movement, not size. A game with 500k CCU that has been flat for
+    three years has stable coverage; a game that doubled in a day is the one
+    whose video situation is actually changing, and that is the question the
+    digest cannot answer without YouTube.
+    """
+    rows = s.execute(text("""
+        with latest as (select max(ts) as ts from snapshots),
+        move as (
+            select sn.universe_id, sn.playing,
+                   sn.playing::float / nullif(prev.playing, 0) as ratio
+            from snapshots sn
+            join latest l on sn.ts = l.ts
+            left join snapshots prev
+              on prev.universe_id = sn.universe_id
+             and prev.ts = (select min(ts) from snapshots p2
+                            where p2.universe_id = sn.universe_id)
+        )
+        select g.universe_id, g.name, m.playing, m.ratio
+        from move m join games g using(universe_id)
+        where m.playing >= :floor
+        order by coalesce(m.ratio, 1) desc, m.playing desc
+        limit 60
+    """), {"floor": MIN_CCU_FOR_SEARCH}).fetchall()
+
+    out = []
+    for uid, name, playing, ratio in rows:
+        clean = _clean_name(name)
+        if len(clean) < 4:
+            continue
+        out.append({"universe_id": uid, "name": name, "query": f"roblox {clean}",
+                    "ccu": int(playing or 0), "ratio": float(ratio or 1)})
+        if len(out) >= limit:
             break
-    return [f"roblox {c}" for c in clean]
+    return out
 
 
 def run(budget: int = DEFAULT_BUDGET, dry: bool = False) -> dict:
@@ -136,13 +191,21 @@ def run(budget: int = DEFAULT_BUDGET, dry: bool = False) -> dict:
             stats["skipped"] = "нет игр в базе"
             return stats
 
-        # Assemble the query list in priority order: localized first (they find
-        # things English search cannot), then generic, then per-game.
-        queries = list(LOCALE_QUERIES.values()) + BASE_QUERIES
-        queries += _game_query(s, limit=2)
+        # Game-targeted queries first. They are the ones that reliably return
+        # matches: the query contains the game name, so a creator's vague title
+        # does not matter. Generic queries come last and usually get cut by the
+        # budget, which is correct - they were the least productive.
+        targets = _target_games(s, limit=TARGET_GAMES)
+        queries = [t["query"] for t in targets]
+        queries += list(LOCALE_QUERIES.values()) + BASE_QUERIES
 
         chosen = plan(queries, budget)
         stats["planned"] = len(chosen)
+        stats["targets"] = len(targets)
+
+        # Keep the universe_id for each chosen game query, so a match can be
+        # attributed without relying on the token pass.
+        target_by_query = {t["query"]: t for t in targets}
 
         if dry:
             stats["skipped"] = "dry run"
@@ -171,6 +234,7 @@ def run(budget: int = DEFAULT_BUDGET, dry: bool = False) -> dict:
             vid = v.get("video_id")
             if vid and vid not in seen_ids:
                 seen_ids.add(vid)
+                v["_query"] = q     # attribution comes back to this later
                 collected.append(v)
 
     if not collected:
@@ -237,13 +301,24 @@ def run(budget: int = DEFAULT_BUDGET, dry: bool = False) -> dict:
             if hit is None and not matcher.suspicious_title(v.get("title")):
                 hit = matcher.best_match(v.get("title") or "", games)
 
+            # The search query itself is evidence. If this video came back for
+            # "roblox Sell Fries" and YouTube ranked it relevant, it is about
+            # that game - that is the whole point of searching by name instead
+            # of waiting for the creator to type it.
+            if hit is None:
+                tgt = target_by_query.get(v.get("_query"))
+                if tgt:
+                    hit = {"universe_id": tgt["universe_id"], "method": "search",
+                           "containment": 0.5, "matched": tgt["query"][:128],
+                           "score": 1.0}
+
             if hit:
                 s.add(Mention(
                     video_id=vid, universe_id=int(hit["universe_id"]),
                     observed=utcnow(), containment=hit.get("containment"),
                     matched=(hit.get("matched") or "")[:128],
                     channel_id=v.get("channel_id"), lang="en",
-                    method=hit.get("method"), score=hit.get("score")))
+                    method=(hit.get("method") or "")[:12], score=hit.get("score")))
                 matched.add(vid)
                 stats["mentions"] += 1
 

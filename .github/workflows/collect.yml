@@ -42,9 +42,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -74,7 +74,7 @@ jobs:
       # The embedding model (~120 MB) is cached so it downloads once, not on
       # every run. This cache holds a model, not data, so eviction is harmless.
       - name: Cache embedding model
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: data/models
           key: emb-model-v1
@@ -98,14 +98,15 @@ jobs:
             python src/youtube_collect.py --no-embed
           fi
 
-      # API discovery: finds videos on channels we do not track yet. Costs real
-      # quota, so it runs twice a day with a hard unit budget rather than on
-      # every tick. Without YT_API_KEY it exits immediately and RSS carries on.
+      # API discovery: searches YouTube BY GAME NAME for the games that moved
+      # most, instead of waiting for a tracked channel to mention one. Costs
+      # real quota (1,100 units/run), so twice a day with a hard budget.
+      # Without YT_API_KEY it exits immediately and RSS carries on.
       - name: YouTube discovery (API)
         run: |
           H=$(date -u +%H)
           if [ "$H" = "00" ] || [ "$H" = "12" ]; then
-            python src/yt_discovery.py --budget 800
+            python src/yt_discovery.py --budget 1200
           fi
 
       # Weekly channel audit: deactivates feeds that produce no Roblox signal.
@@ -149,7 +150,7 @@ jobs:
       # Keep the markdown/CSV reports for 7 days. The database itself lives in
       # Neon, so there is nothing to upload for it.
       - name: Keep reports (7 days)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: reports-${{ github.run_id }}
@@ -170,8 +171,8 @@ jobs:
     steps:
       # Re-run the digest against the live database. The snapshot job's copy is
       # not shared between jobs, and the page must reflect the same run.
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -187,8 +188,8 @@ jobs:
           if [ -n "$latest" ]; then cp "$latest" docs/opportunity.md; fi
 
       - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: docs
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
