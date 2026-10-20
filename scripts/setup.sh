@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup. Run from the repository root (the folder with README.md):
+# One-time setup. Run from the repository root (the folder with src):
 #   bash scripts/setup.sh
 set -e
 
@@ -15,7 +15,7 @@ if [ ! -f requirements.txt ]; then
             exit 1
         fi
     done
-    echo "Найди папку, где лежат README.md и src, и запусти скрипт оттуда."
+    echo "Найди папку, где лежит src, и запусти скрипт оттуда."
     exit 1
 fi
 

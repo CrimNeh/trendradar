@@ -11,7 +11,7 @@ echo.
 
 if not exist "requirements.txt" (
     echo ERROR: wrong folder.
-    echo This file must sit in the folder that contains README.md and src.
+    echo This file must sit in the folder that contains src.
     echo Current folder: %CD%
     echo.
     pause

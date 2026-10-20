@@ -16,6 +16,10 @@ on:
     types: [tick]
   workflow_dispatch:
 
+# The publish step commits docs/index.md back to the repo.
+permissions:
+  contents: write
+
 concurrency:
   group: collect
   cancel-in-progress: false
@@ -116,3 +120,26 @@ jobs:
           name: reports-${{ github.run_id }}
           path: reports/
           retention-days: 7
+
+      # Artifacts expire in 7 days and arrive as a zip - no way to glance at the
+      # digest from a phone. This copies the newest digest to docs/ and pushes
+      # it, so GitHub Pages serves it as a page you can bookmark.
+      - name: Publish digest to Pages
+        if: always()
+        run: |
+          latest=$(ls -t reports/*_opportunity.md 2>/dev/null | head -1)
+          if [ -z "$latest" ]; then
+            echo "no opportunity report generated - nothing to publish"
+            exit 0
+          fi
+          mkdir -p docs
+          cp "$latest" docs/index.md
+          git config user.name  "trendradar-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/index.md
+          if git diff --staged --quiet; then
+            echo "digest unchanged"
+          else
+            git commit -m "digest: $(basename "$latest")"
+            git push origin HEAD:main
+          fi

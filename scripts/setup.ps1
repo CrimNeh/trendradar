@@ -1,5 +1,5 @@
 # One-time setup for Windows.
-# Run from the project root (the folder containing README.md and src):
+# Run from the project root (the folder containing src):
 #     .\scripts\setup.ps1
 #
 # If PowerShell refuses to run it:
@@ -31,7 +31,7 @@ if (-not (Test-Path ".\requirements.txt")) {
         Write-Host "    .\scripts\setup.ps1" -ForegroundColor Cyan
     } else {
         Write-Host ""
-        Write-Host "Find the folder that contains README.md and src, then run it from there."
+        Write-Host "Find the folder that contains src, then run it from there."
     }
     Write-Host ""
     exit 1
