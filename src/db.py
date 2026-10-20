@@ -274,6 +274,53 @@ def init_db() -> None:
     _migrate()
 
 
+class Prediction(Base):
+    """One forecast, frozen at the moment it was made.
+
+    APPEND-ONLY. There is no update path and no delete path anywhere in the
+    codebase, by design. The value of this table comes entirely from the fact
+    that a bad forecast cannot be quietly tidied up afterwards - the moment
+    that becomes possible, hit rate stops measuring the signal and starts
+    measuring how carefully the record was massaged.
+
+    `outcome` is the only column that ever changes, and only from NULL to a
+    value, once. `outcome_basis` records how the verdict was reached so a later
+    reader can disagree without rerunning anything.
+    """
+    __tablename__ = "predictions"
+
+    id = Column(PKType, primary_key=True, autoincrement=True)
+
+    kind = Column(String(24), index=True, nullable=False)   # move|clone|anime
+    universe_id = Column(BigInteger, index=True)
+    subject = Column(String(256), nullable=False)           # name as written then
+    claim = Column(String(512), nullable=False)             # plain-language forecast
+
+    # Judging is fixed at creation. If the criterion could be chosen after the
+    # result is known, the target would drift toward whatever happened.
+    metric = Column(String(32), nullable=False)             # ccu|favorites
+    baseline = Column(Float, nullable=False)                # value when predicted
+    criterion = Column(String(24), nullable=False)          # up_20pct|up_10pct
+    horizon_days = Column(Integer, nullable=False)
+
+    # The score that produced the forecast, so accuracy can be tied back to the
+    # ranking that recommended it.
+    score = Column(Float)
+    confidence = Column(Float)
+    cohort_rank = Column(Float)
+
+    made_at = Column(DateTime, default=utcnow, index=True, nullable=False)
+    due_at = Column(DateTime, index=True, nullable=False)
+
+    outcome = Column(String(16), index=True)                # hit|miss|partial|void
+    outcome_value = Column(Float)
+    outcome_basis = Column(String(256))
+    checked_at = Column(DateTime)
+
+    __table_args__ = (
+        Index("ix_pred_due_outcome", "due_at", "outcome"),
+    )
+
 if __name__ == "__main__":
     path = DB_URL.replace("sqlite:///", "")
     if path and not DB_URL.startswith("postgres"):

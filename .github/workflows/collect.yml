@@ -147,6 +147,17 @@ jobs:
       - name: Build HTML digest
         run: python src/digest_html.py
 
+      # Log what this run recommends. Written BEFORE anything is judged, and
+      # deduped per game, so eight runs a day cannot inflate the sample by
+      # predicting the same game eight times.
+      - name: Record forecasts
+        run: python src/predictions.py record
+
+      # Judge anything whose horizon has passed. Writes outcome once; a settled
+      # forecast is never revisited.
+      - name: Resolve due forecasts
+        run: python src/predictions.py resolve
+
       # Keep the markdown/CSV reports for 7 days. The database itself lives in
       # Neon, so there is nothing to upload for it.
       - name: Keep reports (7 days)
