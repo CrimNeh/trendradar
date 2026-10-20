@@ -169,7 +169,7 @@ jobs:
           retention-days: 7
 
   # Separate job because Pages deployment needs its own permissions and an
-  # environment. It consumes the artifact the snapshot job just built.
+  # environment.
   deploy:
     needs: snapshot
     runs-on: ubuntu-latest
@@ -180,14 +180,26 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      # Re-run the digest against the live database. The snapshot job's copy is
-      # not shared between jobs, and the page must reflect the same run.
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
       - run: pip install -q -r requirements.txt
+
+      # The markdown report is produced by opportunity.py in the snapshot job and
+      # captured as an artifact. Without this download the copy step below found
+      # an empty reports/ directory, its `|| true` swallowed the failure, and
+      # docs/opportunity.md was never published - silently, on every run.
+      - name: Fetch reports from the snapshot job
+        uses: actions/download-artifact@v5
+        with:
+          name: reports-${{ github.run_id }}
+          path: reports/
+
+      # Rebuild the page from the live database. The snapshot job's copy is not
+      # shared between jobs, and the page must reflect the same data the
+      # forecasts were recorded against.
       - name: Build HTML digest
         run: python src/digest_html.py
         env:
@@ -196,7 +208,11 @@ jobs:
       - name: Add markdown copy
         run: |
           latest=$(ls -t reports/*_opportunity.md 2>/dev/null | head -1 || true)
-          if [ -n "$latest" ]; then cp "$latest" docs/opportunity.md; fi
+          if [ -n "$latest" ]; then
+            cp "$latest" docs/opportunity.md
+          else
+            echo "::warning::no opportunity.md in the reports artifact"
+          fi
 
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v5

@@ -176,27 +176,25 @@ PLANS = {
 
 
 
-def _ccu_at_latest(s, universe_id: int) -> float | None:
-    row = (s.query(Snapshot.playing)
-            .filter(Snapshot.universe_id == universe_id)
-            .order_by(Snapshot.ts.desc()).first())
-    return float(row[0] or 0) if row else None
-
-
 def _already_open(s, kind: str, universe_id: int | None, subject: str) -> bool:
-    """One open forecast per subject per kind.
+    """One open forecast per game per kind.
 
-    Without this, eight runs a day would create eight overlapping forecasts of
-    the same game, and one hit would count eight times in the score. The sample
-    would grow without the evidence growing.
+    Deduplication keys on `universe_id`, not on the name. Roblox games rename
+    constantly - "[CURE] Violence District" becomes "Violence District [UPDATE]"
+    with the same universe_id - and the first version matched on subject as
+    well. Measured: a renamed game made this return False, so a second row was
+    created for a game already under forecast. Both rows would later be judged
+    on the same window, and one lucky game would count twice in the hit rate.
+
+    The name is only used as a fallback for rows that have no universe_id, which
+    should not exist for `move` but does for aggregate kinds.
     """
     q = s.query(Prediction).filter(
         Prediction.kind == kind,
-        Prediction.outcome.is_(None),
-        Prediction.subject == subject)
+        Prediction.outcome.is_(None))
     if universe_id is not None:
-        q = q.filter(Prediction.universe_id == universe_id)
-    return q.count() > 0
+        return q.filter(Prediction.universe_id == universe_id).count() > 0
+    return q.filter(Prediction.subject == subject).count() > 0
 
 
 def digest_selection() -> pd.DataFrame:
@@ -272,6 +270,14 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
         import digest_html as D
         rows = rows.sort_values("trend", ascending=False)
         rows = rows.head(min(top_n, D.RISING_CARDS))
+
+        # The digest already drops games below its own MIN_CCU inside
+        # relative_moves, but that coupling is implicit and one refactor away
+        # from breaking. Stating it here means the ledger and the page cannot
+        # drift into disagreeing about which games are large enough to forecast
+        # on - a silent split that would record rows the page never showed.
+        floor = getattr(D, "MIN_CCU", MIN_BASELINE_CCU)
+        rows = rows[rows["ccu_last"].fillna(0) >= floor]
 
         # `confidence` must be features._confidence, not r2. They measure
         # different things: r2 is how well a line fits the trend, confidence is
