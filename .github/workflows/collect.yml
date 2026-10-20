@@ -1,10 +1,13 @@
 name: collect
 
-# Every 15 min. GitHub's floor is 5 min and runs can be delayed under load, so
-# 15 is the practical granularity. Free on public repos.
+# Every 3 hours. Chosen for storage and for signal quality, not for detail:
+# one snapshot costs ~236 KB, so 15-min collection fills the Neon free tier in
+# 23 days while 3-hour collection lasts 275. 24h/3d/7d comparisons need only
+# 8/24/56 points, which 3-hour sampling gives comfortably. Only the 6h window
+# gets thin (2 points), and that metric is the least useful of the four.
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "0 */3 * * *"
   # Second trigger for an external pinger (cron-job.org). GitHub's own
   # schedule is best-effort and skipped 80% of runs here; an outside clock
   # fires on time. Send POST /repos/CrimNeh/trendradar/dispatches with
@@ -73,26 +76,36 @@ jobs:
       - name: Collect Roblox
         run: python src/collect.py
 
-      # Link + token matching run every tick. The semantic pass loads a model
-      # and embeds every unmatched title, so it runs once an hour.
+      # Link + token matching run every tick; the semantic pass loads a 120 MB
+      # model and embeds every unmatched title, so it runs on a minority of
+      # ticks. With 8 runs/day, hours divisible by 3 give exactly 2 full passes
+      # (00:00 and 12:00 UTC) and 6 cheap ones.
       - name: Collect YouTube
         run: |
-          if [ "$(date +%M)" -lt 15 ]; then
+          H=$(date -u +%H)
+          if [ "$H" = "00" ] || [ "$H" = "12" ]; then
             python src/youtube_collect.py
           else
             python src/youtube_collect.py --no-embed
           fi
 
-      # External sources change slowly. Steam is ~40 throttled requests, so
-      # every 15 min would be wasteful and rate-limit prone.
-      - name: Collect origins (hourly)
+      # External sources change slowly (Steam charts, anime calendar, devforum).
+      # Steam alone is ~40 throttled requests, so twice a day is both sufficient
+      # and safe from rate limits.
+      - name: Collect origins (2x daily)
         run: |
-          if [ "$(date +%M)" -lt 15 ]; then
+          H=$(date -u +%H)
+          if [ "$H" = "00" ] || [ "$H" = "12" ]; then
             python src/origins.py
           fi
 
       - name: Report
         run: python src/report.py
+
+      # The decision layer: which niches are open, what to build, what to avoid.
+      # Runs after report.py so both land in the same artifact.
+      - name: Opportunities (what to build)
+        run: python src/opportunity.py
 
       # Keep the markdown/CSV reports for 7 days. The database itself lives in
       # Neon, so there is nothing to upload for it.
