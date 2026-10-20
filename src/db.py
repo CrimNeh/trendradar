@@ -14,10 +14,10 @@ origin_signal: external signals that precede Roblox trends
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
-    BigInteger, Column, DateTime, Float, Integer, String, Text, UniqueConstraint,
+    BigInteger, Column, Date, DateTime, Float, Integer, String, Text, UniqueConstraint,
     create_engine, Index,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -127,6 +127,8 @@ class YtChannel(Base):
     lang = Column(String(8), index=True)     # en, es, pt, id, ar, ru, ...
     subscribers = Column(BigInteger)
     active = Column(Integer, default=1)
+    # Consecutive polls that returned an empty feed. Used to retire dead channels.
+    empty_polls = Column(Integer, default=0)
     last_checked = Column(DateTime)
     added = Column(DateTime, default=utcnow)
 
@@ -194,7 +196,12 @@ class OriginSignal(Base):
 # tables, so a database created by an older version needs them added in place.
 _MIGRATIONS = {
     "mentions": [("method", "VARCHAR(12)"), ("score", "FLOAT")],
-    "yt_channels": [("lang", "VARCHAR(8)")],
+    "yt_channels": [
+        ("lang", "VARCHAR(8)"),
+        # Consecutive empty polls, so a channel that never posts is retired
+        # instead of being fetched every run forever.
+        ("empty_polls", "INTEGER DEFAULT 0"),
+    ],
 }
 
 
@@ -244,6 +251,21 @@ def _ensure_dir() -> None:
         path = DB_URL.replace("sqlite:///", "")
         if path and path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+
+
+class ApiQuota(Base):
+    """Daily YouTube Data API spend, so a loop cannot silently exceed the limit.
+
+    The free quota is 10,000 units/day and is shared by every tool using the
+    same key. Charging before the request - rather than after - means a crash
+    mid-call still counts, which errs toward under-spending. That is the right
+    direction: an over-spent key returns 403 for the rest of the day and there
+    is no way to get the time back.
+    """
+    __tablename__ = "api_quota"
+
+    day = Column(Date, primary_key=True)
+    used = Column(Integer, default=0, nullable=False)
 
 
 def init_db() -> None:

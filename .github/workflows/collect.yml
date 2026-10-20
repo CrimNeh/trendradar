@@ -32,6 +32,9 @@ env:
   # cache - the cache is evicted without warning and would silently reset the
   # whole history.
   TRENDRADAR_DB: ${{ secrets.TRENDRADAR_DB }}
+  # Optional. Without it the RSS collector still runs; the API is only
+  # used for keyword discovery and exact stats.
+  YT_API_KEY: ${{ secrets.YT_API_KEY }}
   PYTHONUNBUFFERED: "1"
 
 jobs:
@@ -93,6 +96,25 @@ jobs:
             python src/youtube_collect.py
           else
             python src/youtube_collect.py --no-embed
+          fi
+
+      # API discovery: finds videos on channels we do not track yet. Costs real
+      # quota, so it runs twice a day with a hard unit budget rather than on
+      # every tick. Without YT_API_KEY it exits immediately and RSS carries on.
+      - name: YouTube discovery (API)
+        run: |
+          H=$(date -u +%H)
+          if [ "$H" = "00" ] || [ "$H" = "12" ]; then
+            python src/yt_discovery.py --budget 800
+          fi
+
+      # Weekly channel audit: deactivates feeds that produce no Roblox signal.
+      # Run on Monday 00:00 so it does not race the discovery pass.
+      - name: Audit channels (weekly)
+        run: |
+          D=$(date -u +%u); H=$(date -u +%H)
+          if [ "$D" = "1" ] && [ "$H" = "00" ]; then
+            python src/channel_quality.py --apply
           fi
 
       # External sources change slowly (Steam charts, anime calendar, devforum).

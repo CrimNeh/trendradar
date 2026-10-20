@@ -72,6 +72,42 @@ def extract_place_ids(description: str | None) -> list[int]:
     return seen
 
 
+_INDEX_CACHE: dict[int, tuple] = {}
+
+
+def _candidates(tt: set, games: pd.DataFrame):
+    """Only games sharing at least one token with the title.
+
+    The original loop compared every title against every game. With 863 videos
+    and 452 games that is 390k set operations per run, and it dominated the
+    runtime: RSS fetch took 0.9 s while matching took ~190 s.
+
+    An inverted index keyed on token turns that into a few dict lookups. The
+    cache is keyed on id() and holds a reference to the frame, so a rebuilt
+    frame cannot be served stale entries.
+    """
+    key = id(games)
+    cached = _INDEX_CACHE.get(key)
+    if cached is None or cached[0] is not games:
+        index: dict = {}
+        for row in games.itertuples():
+            toks = {t for t in tokens(row.name) if t not in NOISE and len(t) >= 3}
+            for t in toks:
+                index.setdefault(t, []).append(row)
+        _INDEX_CACHE.clear()
+        _INDEX_CACHE[key] = (games, index)
+        cached = _INDEX_CACHE[key]
+
+    index = cached[1]
+    seen: set = set()
+    for t in tt:
+        for row in index.get(t, ()):
+            if row.Index in seen:
+                continue
+            seen.add(row.Index)
+            yield row
+
+
 def match_video(title: str, games: pd.DataFrame,
                 min_containment: float = 0.75) -> list[dict]:
     """Games whose names are substantially covered by the video title.
@@ -86,7 +122,7 @@ def match_video(title: str, games: pd.DataFrame,
     title_words = {w.lower() for w in re.findall(r"[^\W\d_][\w'’]*", title or "")}
 
     hits = []
-    for row in games.itertuples():
+    for row in _candidates(tt, games):
         gt = {t for t in tokens(row.name) if t not in NOISE and len(t) >= 3}
         if not gt:
             continue
