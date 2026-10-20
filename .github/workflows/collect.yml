@@ -111,6 +111,12 @@ jobs:
       - name: Opportunities (what to build)
         run: python src/opportunity.py
 
+      # The clone-target ranking. opportunity.py answers "where is the market
+      # empty"; this answers "who is winning and can be copied", which is the
+      # actual strategy being run here.
+      - name: Clone targets (who to copy)
+        run: python src/clone_targets.py
+
       # Keep the markdown/CSV reports for 7 days. The database itself lives in
       # Neon, so there is nothing to upload for it.
       - name: Keep reports (7 days)
