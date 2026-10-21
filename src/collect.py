@@ -135,12 +135,48 @@ def collect(do_servers: bool = True) -> dict:
             "sponsored": len(sponsored), "error": None}
 
 
+def _recent_snapshot_hours() -> float | None:
+    """Hours since the newest snapshot, or None if the table is empty.
+
+    Used to refuse a duplicate run. Two triggers fire at the same minute -
+    GitHub's cron and the external pinger - and `concurrency` with
+    `cancel-in-progress: false` queues the second instead of dropping it. Both
+    pass, and the whole market is written twice. Measured over 41 hours: 429
+    duplicate pairs less than 3 minutes apart, roughly doubling storage, the
+    YouTube quota draw and the snapshot density `excess_samples` reads.
+    """
+    from sqlalchemy import func
+    with Session() as s:
+        newest = s.query(func.max(Snapshot.ts)).scalar()
+    if newest is None:
+        return None
+    return (utcnow() - newest).total_seconds() / 3600
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--servers", action="store_true",
                    help="also fetch server-fullness stats (slow, often rate limited)")
     p.add_argument("--no-servers", action="store_true",
                    help="skip server stats (now the default; kept for compatibility)")
+    p.add_argument("--force", action="store_true",
+                   help="run even if a snapshot was taken less than --min-gap hours ago")
+    p.add_argument("--min-gap", type=float, default=0.5,
+                   help="skip if the newest snapshot is younger than this, "
+                        "in hours (default 0.5 = 30 min)")
     a = p.parse_args()
+
     do_servers = a.servers and not a.no_servers
+
+    # The guard lives here, not in the workflow, because it has to hold no
+    # matter WHICH trigger fired. A cron line cannot know the pinger already
+    # ran, and the pinger cannot know that cron did.
+    if not a.force:
+        age = _recent_snapshot_hours()
+        if age is not None and age < a.min_gap:
+            print(f"пропуск: последний снимок {age*60:.0f} мин назад "
+                  f"(порог {a.min_gap*60:.0f} мин) — это повторный триггер, "
+                  f"а не новый прогон. --force, если нужен явный запуск.")
+            raise SystemExit(0)
+
     print(collect(do_servers=do_servers))

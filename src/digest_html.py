@@ -37,7 +37,12 @@ OUT = os.path.join(os.path.dirname(__file__), "..", "docs")
 # Below this a gain is noise, not a trend.
 MIN_CCU = 500
 # Share change needed to call something "rising" or "falling".
-MOVE_THRESHOLD = 0.15
+# Share growth per day, in log2 units: >0.09 means the game's slice of the
+# market is growing ~6.4%/day faster than the market itself.
+# Was 0.15 while `trend` was slope * hours-of-history; at the 41 h archive
+# of 21 Oct those were the same bar. Rescaled once, so the gate keeps the
+# same strictness now that `trend` no longer grows with the archive.
+MOVE_THRESHOLD = 0.09
 
 # How many rising cards the page renders. predictions.py reads this so the
 # ledger records exactly what was shown - it previously wrote 10 while the page
@@ -220,7 +225,18 @@ def build_rows(f: pd.DataFrame, moves: pd.DataFrame,
     m["yt_views"] = m["yt"].map(lambda d: d.get("views", 0) if d else 0)
     m["yt_vph"] = m["yt"].map(lambda d: d.get("vph", 0.0) if d else 0.0)
     m["yt_langs"] = m["yt"].map(lambda d: d.get("langs", 0) if d else 0)
-    m["trend"] = m["share_slope"] * m["span_h"]
+    # Normalised to a per-day rate, NOT multiplied by the length of the whole
+    # history. The first version used `share_slope * span_h`, where span_h is
+    # every hour ever collected. The slope is per hour, so the product grew with
+    # the archive: measured, the same slope scored 1.0 at 41 h of history, 17.5
+    # at 720 h and 52.6 at 2160 h. MOVE_THRESHOLD is a constant, so after a
+    # month the gate would have been ~17x weaker than the day it was chosen and
+    # almost the whole market would have qualified.
+    #
+    # Ranking was never affected - span_h is identical for every game, so it
+    # cancelled out of the sort - but the threshold was. A per-day rate means
+    # the number keeps its meaning as the archive grows.
+    m["trend"] = m["share_slope"] * 24
     return m.sort_values("trend", ascending=False).reset_index(drop=True)
 
 

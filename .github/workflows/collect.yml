@@ -6,11 +6,17 @@ name: collect
 # 8/24/56 points, which 3-hour sampling gives comfortably. Only the 6h window
 # gets thin (2 points), and that metric is the least useful of the four.
 on:
-  schedule:
-    - cron: "0 */3 * * *"
-  # Second trigger for an external pinger (cron-job.org). GitHub's own
-  # schedule is best-effort and skipped 80% of runs here; an outside clock
-  # fires on time. Send POST /repos/CrimNeh/trendradar/dispatches with
+  # No `schedule` on purpose. It used to sit next to repository_dispatch, so at
+  # every third hour BOTH fired and the whole market was collected twice -
+  # `cancel-in-progress: false` queues the duplicate rather than dropping it.
+  # Measured: 429 duplicate pairs with <=3 minutes between them over 41 h.
+  #
+  # The external pinger alone is enough and, unlike GitHub's best-effort
+  # scheduler, it fires on time. collect.py also refuses to run when the
+  # newest snapshot is younger than 30 min, so this holds even if a schedule
+  # is added back.
+  #
+  # Pinger sends POST /repos/CrimNeh/trendradar/dispatches with
   # {"event_type": "tick"} using a token that only has Actions: write.
   repository_dispatch:
     types: [tick]
