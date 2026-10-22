@@ -174,6 +174,12 @@ PLANS = {
     "anime": {"metric": "ccu", "criterion": "up_10pct", "horizon": 21},
 }
 
+# How far from the due date a snapshot may sit and still be used to judge it.
+# Sized to the collection interval: 3-hour ticks plus slack for a missed run,
+# and well under the 7-day horizon so a game that left the charts three days
+# early cannot be graded on a reading from before it fell.
+STALE_HOURS = 48
+
 
 
 def _already_open(s, kind: str, universe_id: int | None, subject: str) -> bool:
@@ -460,23 +466,38 @@ def _judge(criterion: str, base: float, now: float,
     return "miss", f"{change*100:.0f}%"
 
 
-def _value_now_fresh(s, universe_id: int, metric: str):
-    """(value, age_hours, snapshot_ts). The timestamp matters as much as the
-    value: the market benchmark has to be read at the same moment."""
-    """Latest value plus how stale it is, in hours.
+def _value_now_fresh(s, universe_id: int, metric: str, at=None):
+    """(value, age_hours, snapshot_ts) nearest to `at`; `at` defaults to now.
 
-    Returning the age alongside the value is the point: the caller has to decide
-    whether a number is recent enough to judge on, and it cannot do that
-    without knowing when it was taken.
+    `at` is the DUE date, not the run date, and that is the whole point. A
+    7-day claim graded on "whatever the latest snapshot is when the job
+    happens to fire" silently measures a longer window while still calling it
+    7 days - and the job fires on an external pinger, so being late is the
+    normal case, not an exception. Measured on this project's rows, due_at sits
+    7.00-7.01 days after made_at, so the window error is small here; it is
+    bounded rather than eliminated by judging at the due date.
+
+    age_hours is signed against `at`: positive means the snapshot predates the
+    deadline. Returning None means no snapshot sits within STALE_HOURS of the
+    deadline, which the caller must read as the game having left the charts.
     """
     col = Snapshot.playing if metric == "ccu" else Snapshot.favorites
-    row = (s.query(col, Snapshot.ts)
-            .filter(Snapshot.universe_id == universe_id)
-            .order_by(Snapshot.ts.desc()).first())
-    if not row:
+    target = at or utcnow()
+    lo = target - timedelta(hours=STALE_HOURS)
+    # Never read PAST the deadline. A snapshot taken after due_at contains
+    # information the forecast did not have, and grading on it would score the
+    # model on hindsight. The only slack allowed is one collection interval
+    # (3 h), because the tick that covers the deadline can land just after it.
+    hi = target + timedelta(hours=3)
+    rows = (s.query(col, Snapshot.ts)
+             .filter(Snapshot.universe_id == universe_id)
+             .filter(Snapshot.ts >= lo, Snapshot.ts <= hi)
+             .all())
+    if not rows:
         return None, None, None
-    age_h = (utcnow() - row[1]).total_seconds() / 3600 if row[1] else None
-    return float(row[0] or 0), age_h, row[1]
+    best = min(rows, key=lambda r: abs((r[1] - target).total_seconds()))
+    age_h = (target - best[1]).total_seconds() / 3600
+    return float(best[0] or 0), age_h, best[1]
 
 
 def resolve() -> dict:
@@ -493,20 +514,33 @@ def resolve() -> dict:
             if row is None or row.outcome is not None:
                 continue
 
+            # Judge at the DUE date, not at whatever moment this job fired.
+            # The horizon is part of the claim; grading it on a longer window
+            # grades a different claim.
             now_val, age_h, snapshot_ts = _value_now_fresh(
-                s, p["universe_id"], p["metric"])
+                s, p["universe_id"], p["metric"], at=p["due_at"])
 
             # A game that dropped out of the carousels stops receiving
-            # snapshots. Judging it on a week-old reading would report "no
-            # growth" when the truth is "we stopped looking" - and that is the
-            # most common way a forecast dies on Roblox.
-            if now_val is None or (age_h is not None and age_h > 48):
-                row.outcome = "void"
+            # snapshots, so there is nothing to judge it on. That is not a
+            # reason to drop it from the sample - it is the result.
+            #
+            # This used to write `void`, which excludes the row from the
+            # denominator entirely. But falling off the charts is the most
+            # common way a "it will keep growing" claim loses, so excluding it
+            # counted every failure as "not measured" and inflated the hit rate
+            # by exactly the thing being measured. Intent-to-treat: the row was
+            # written and the claim was made, so it gets graded. Missing data
+            # at the deadline means the game was below the collection floor,
+            # which is a miss on a growth claim.
+            if now_val is None:
+                row.outcome = "miss"
                 row.outcome_basis = (
-                    "нет данных" if now_val is None
-                    else f"данные устарели на {age_h:.0f} ч — игра выпала из чартов")[:256]
+                    f"нет данных на срок: последний снимок дальше {STALE_HOURS} ч "
+                    f"от {p['due_at']:%Y-%m-%d %H:%M} — игра выпала из чартов")[:256]
+                row.outcome_value = None
                 row.checked_at = utcnow()
-                stats["void"] += 1
+                stats["miss"] += 1
+                stats["checked"] += 1
                 continue
 
             # Market median must be read at the game's own snapshot time, not
@@ -562,6 +596,15 @@ def score() -> dict:
         "by_kind": (df.groupby("kind")["hit_num"].mean().mul(100).round(1)
                     .to_dict()),
     }
+
+    # How a miss happened matters as much as how many. A game that fell off the
+    # charts never got the chance to grow, which is a different failure from
+    # "grew, but slower than the market" - and the two point at different fixes.
+    # Reported separately so the numerator cannot hide behind the denominator.
+    no_data = df[df["outcome_value"].isna()]
+    if not no_data.empty:
+        out["miss_no_data"] = int(len(no_data))
+        out["miss_no_data_pct"] = round(len(no_data) / len(df) * 100, 1)
 
     # Baseline. This has to be measured on the SAME quantity the criterion
     # grades, which for "beat the market" is excess growth, not absolute growth.
