@@ -97,9 +97,8 @@ jobs:
       # (00:00 and 12:00 UTC) and 6 cheap ones.
       - name: Collect YouTube
         run: |
-          H=$(date -u +%H)
-          if [ "$H" = "00" ] || [ "$H" = "12" ]; then
-            python src/youtube_collect.py
+          if python src/due.py youtube_full 11; then
+            python src/youtube_collect.py && python src/due.py mark youtube_full
           else
             python src/youtube_collect.py --no-embed
           fi
@@ -110,28 +109,25 @@ jobs:
       # Without YT_API_KEY it exits immediately and RSS carries on.
       - name: YouTube discovery (API)
         run: |
-          H=$(date -u +%H)
-          if [ "$H" = "00" ] || [ "$H" = "12" ]; then
-            python src/yt_discovery.py --budget 1200
+          if python src/due.py yt_discovery 11; then
+            python src/yt_discovery.py --budget 1200 && python src/due.py mark yt_discovery
           fi
 
       # Weekly channel audit: deactivates feeds that produce no Roblox signal.
       # Run on Monday 00:00 so it does not race the discovery pass.
       - name: Audit channels (weekly)
         run: |
-          D=$(date -u +%u); H=$(date -u +%H)
-          if [ "$D" = "1" ] && [ "$H" = "00" ]; then
-            python src/channel_quality.py --apply
+          if python src/due.py audit 160; then
+            python src/channel_quality.py --apply && python src/due.py mark audit
           fi
 
       # External sources change slowly (Steam charts, anime calendar, devforum).
       # Steam alone is ~40 throttled requests, so twice a day is both sufficient
       # and safe from rate limits.
-      - name: Collect origins (2x daily)
+      - name: Collect origins (every ~11h)
         run: |
-          H=$(date -u +%H)
-          if [ "$H" = "00" ] || [ "$H" = "12" ]; then
-            python src/origins.py
+          if python src/due.py origins 11; then
+            python src/origins.py && python src/due.py mark origins
           fi
 
       - name: Report
