@@ -46,7 +46,13 @@ env:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20 was set when a normal run finished in ~11 min. Since the due-gate made
+    # origins, YouTube discovery and the full embedding pass all land on the
+    # same tick, the heavy runs now take ~20.4 min - three of them were killed
+    # at exactly 20.0 min, on the `Collect YouTube` step, skipping everything
+    # after it (report, digest, record, resolve). 35 leaves room for the 120 MB
+    # embedding model on a cold cache without letting a hung run burn an hour.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v5
 
