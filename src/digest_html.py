@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
-from db import Session, Mention, Snapshot, YtVideo  # noqa: E402
+from db import Game, Session, Mention, Snapshot, YtVideo  # noqa: E402
 from features import build_features, flag_suspect  # noqa: E402
 import forecast  # noqa: E402
 
@@ -66,6 +66,31 @@ def _pct(x: float | None) -> str:
     return f"{(x - 1) * 100:+.0f}%"
 
 
+# Orphan games (games.origin = 'orphan': discovered outside the Roblox
+# carousels, see collect.collect_orphans) are snapshotted but kept OUT of the
+# market median and the per-game share calculations while this is False.
+#
+# The reason is the ruler, not the quality of those games. Orphans are
+# systematically smaller (measured 2026-10-28: median 116 CCU overall, 1812
+# among those above the 500 floor, against a carousel market median of
+# ~3000-4000), so folding 161 of them in shifts the median that every "did this
+# game beat the market" number is divided by. The page and the forecast ledger
+# both read this function - patching only predictions.py would leave the digest
+# ranking games against one market while the ledger graded them against another.
+#
+# Flip to True once the week-2 comparison is finished and the sample can move
+# without invalidating the very comparison it exists to make.
+INCLUDE_ORPHANS = False
+
+
+def _orphan_uids(s) -> set[int]:
+    """Games excluded from market medians and share calculations right now."""
+    if INCLUDE_ORPHANS:
+        return set()
+    return {uid for (uid,) in
+            s.query(Game.universe_id).filter(Game.origin == "orphan").all()}
+
+
 def market_series() -> tuple[pd.DataFrame, pd.Series]:
     """Snapshot matrix plus the per-timestamp market median.
 
@@ -74,9 +99,14 @@ def market_series() -> tuple[pd.DataFrame, pd.Series]:
     """
     with Session() as s:
         rows = s.query(Snapshot.universe_id, Snapshot.ts, Snapshot.playing).all()
+        drop = _orphan_uids(s)
     df = pd.DataFrame(rows, columns=["universe_id", "ts", "playing"])
     if df.empty:
         return pd.DataFrame(), pd.Series(dtype=float)
+    if drop:
+        df = df[~df["universe_id"].isin(drop)]
+        if df.empty:
+            return pd.DataFrame(), pd.Series(dtype=float)
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     piv = df.pivot_table(index="ts", columns="universe_id",
                          values="playing", aggfunc="last").sort_index()

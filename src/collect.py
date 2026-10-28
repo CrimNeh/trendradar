@@ -7,7 +7,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -20,6 +20,14 @@ from db import ChannelHit, Game, Session, Snapshot, init_db, utcnow
 # --servers when you want to try, the circuit breaker protects the run either
 # way. Set SERVER_SAMPLE=0 to keep it off everywhere.
 SERVER_SAMPLE = int(os.environ.get("SERVER_SAMPLE", "40"))
+
+# Orphan sweep thresholds. See collect_orphans() for why the floor matters:
+# the digest and the forecast ledger both drop games under 500 CCU, so a
+# snapshot of a game that can never qualify only costs storage. Deliberately
+# the same number as digest_html.MIN_CCU and predictions.MIN_BASELINE_CCU -
+# one floor, stated once per consumer, never two different ones.
+ORPHAN_MIN_CCU = int(os.environ.get("ORPHAN_MIN_CCU", "500"))
+ORPHAN_RECHECK_H = float(os.environ.get("ORPHAN_RECHECK_H", "24"))
 
 
 def _parse_dt(raw: str | None):
@@ -109,6 +117,13 @@ def collect(do_servers: bool = True) -> dict:
             g.niche = niche
             g.tags = mechs
             g.last_seen = ts
+            # Promotion. A game discovered via YouTube and later picked up by a
+            # carousel is no longer an orphan: it belongs to the market sample
+            # now, and its whole history (orphan-era snapshots included) becomes
+            # eligible for the median and the base rate. Without this it would
+            # stay 'orphan' forever and be excluded from the metrics even while
+            # appearing in every chart.
+            g.origin = "carousel"
 
             hits = membership[uid]
             st = srv.get(uid, {})
@@ -133,6 +148,90 @@ def collect(do_servers: bool = True) -> dict:
     return {"ts": ts, "found": found, "games": written,
             "server_calls": len(srv), "skipped_no_details": found - len(uids),
             "sponsored": len(sponsored), "error": None}
+
+
+def collect_orphans(ts, limit: int = 600) -> dict:
+    """Snapshot the games discovery found but the carousels never show.
+
+    Measured on this database 2026-10-28: 496 of 1200 games (41%) had no CCU
+    history at all, every one of them discovered through a YouTube mention
+    rather than a Roblox carousel. They were not junk - several carry 500M+
+    visits - they were simply invisible, because collect() only walks the
+    carousels and a game outside them is added to `games` and never measured
+    again.
+
+    Asked Roblox directly for all 499 of them: median CCU 116, but 161 (32%)
+    sat above the 500 floor, and that group's median was 1812 - comparable to
+    or larger than the carousel sample. So this is not a long tail of noise; a
+    third of it is material and was being thrown away.
+
+    Two deliberate limits:
+
+    * ORPHAN_MIN_CCU - below it, no snapshot is written. 338 of the 499 were
+      under 500 CCU, mostly single-digit traffic from one small video. They can
+      never enter a forecast (the digest and the ledger both floor at 500), so
+      storing them forever only costs rows.
+    * ORPHAN_RECHECK_H - a game is re-queried at most once a day. Without it
+      the same permanently-tiny games would be asked about on all 8 daily runs
+      and dominate the sweep's cost. `orphan_checked` is stamped whether or
+      not a snapshot was written, so the skip is durable.
+
+    Cost: one call per 50 games (roblox_api.get_details batches), so a full
+    sweep of 500 is 10 calls - cheaper than a single carousel pass.
+
+    These snapshots are excluded from the market median and the base rate
+    until the week-2 comparison is done; see digest_html.INCLUDE_ORPHANS.
+    """
+    init_db()
+    cutoff = ts - timedelta(hours=ORPHAN_RECHECK_H)
+    with Session() as s:
+        rows = (s.query(Game.universe_id)
+                 .filter(Game.origin == "orphan")
+                 .filter((Game.orphan_checked.is_(None))
+                         | (Game.orphan_checked < cutoff))
+                 .order_by(Game.orphan_checked.asc().nullsfirst())
+                 .limit(limit).all())
+    uids = [r[0] for r in rows]
+    if not uids:
+        return {"asked": 0, "snapshotted": 0, "below_floor": 0, "unavailable": 0}
+
+    details = {d["id"]: d for d in api.get_details(uids)}
+    written = below = gone = 0
+    with Session() as s:
+        for uid in uids:
+            g = s.get(Game, uid)
+            if g is None:
+                continue
+            g.orphan_checked = ts
+            d = details.get(uid)
+            # Roblox returns nothing for a deleted or private universe. Leave
+            # the row as 'orphan' so it is retried tomorrow: a game reinstated
+            # later is picked up without intervention.
+            if d is None:
+                gone += 1
+                continue
+            ccu = d.get("playing") or 0
+            g.name = (d.get("name") or g.name or "")[:256]
+            g.last_seen = ts
+            if ccu < ORPHAN_MIN_CCU:
+                below += 1
+                continue
+            s.add(Snapshot(
+                universe_id=uid, ts=ts, playing=ccu,
+                visits=d.get("visits", 0),
+                favorites=d.get("favoritedCount", 0),
+                max_players=d.get("maxPlayers"),
+                # No carousel membership by definition: zero rather than NULL,
+                # so "not in any chart" stays distinguishable from "not measured".
+                chart_count=0, best_chart_rank=None, is_sponsored=0,
+            ))
+            written += 1
+        s.commit()
+
+    print(f"[orphans] asked {len(uids)}, snapshotted {written}, "
+          f"below {ORPHAN_MIN_CCU} CCU {below}, unavailable {gone}", flush=True)
+    return {"asked": len(uids), "snapshotted": written,
+            "below_floor": below, "unavailable": gone}
 
 
 def _recent_snapshot_hours() -> float | None:
@@ -179,4 +278,10 @@ if __name__ == "__main__":
                   f"а не новый прогон. --force, если нужен явный запуск.")
             raise SystemExit(0)
 
-    print(collect(do_servers=do_servers))
+    stats = collect(do_servers=do_servers)
+    print(stats)
+    # The orphan sweep runs after the carousel pass, and only when that pass
+    # actually wrote something - a failed collection should not be masked by a
+    # sweep reporting its own clean counts.
+    if isinstance(stats, dict) and stats.get("ts") and not stats.get("error"):
+        print(collect_orphans(stats["ts"]))

@@ -81,6 +81,26 @@ class Game(Base):
     tags = Column(String(256))
     first_seen = Column(DateTime, default=utcnow)
     last_seen = Column(DateTime, default=utcnow)
+    # How this game entered the database.
+    #
+    #   carousel : seen in a Roblox discovery carousel. The original, and still
+    #              the only, source of the market sample that the digest, the
+    #              market median and the base rate are built from.
+    #   orphan   : discovered another way (currently YouTube mentions) and never
+    #              observed in a carousel. Before 2026-10-28 these were added to
+    #              `games` and never snapshotted at all - 496 of 1200 rows (41%)
+    #              had no CCU history, including titles with 500M+ visits. They
+    #              are now snapshotted by collect.collect_orphans(), but stay
+    #              OUT of the market median and base rate until the week-2
+    #              comparison is done (digest_html.INCLUDE_ORPHANS), because
+    #              adding them changes the sample the comparison is made on.
+    #
+    # A game that later appears in a carousel is promoted back to 'carousel' by
+    # collect(), and its full history becomes eligible immediately.
+    origin = Column(String(16), default="carousel", index=True)
+    # Last time the orphan sweep asked Roblox for this game's live CCU. Without
+    # it every run re-queries the same ~340 permanently-tiny games.
+    orphan_checked = Column(DateTime)
 
 
 class Snapshot(Base):
@@ -208,6 +228,11 @@ _MIGRATIONS = {
     # to the forecast it was computed for, so the question is answerable with
     # one query instead of a script.
     "predictions": [("r2", "FLOAT"), ("ruleset_version", "INTEGER DEFAULT 2")],
+    # origin defaults to 'carousel' so every pre-existing row keeps meaning
+    # exactly what it meant before: "came from a discovery carousel".
+    # orphan_checked tracks the last sweep, so a permanently-tiny game is asked
+    # about once a day instead of on all 8 runs.
+    "games": [("origin", "VARCHAR(16) DEFAULT 'carousel'"), ("orphan_checked", "DATETIME")],
 }
 
 
@@ -236,6 +261,8 @@ class OriginHistory(Base):
 def _migrate() -> None:
     from sqlalchemy import inspect, text
     insp = inspect(engine)
+    is_pg = engine.dialect.name == "postgresql"
+    added: set[str] = set()
     with engine.begin() as con:
         for table, cols in _MIGRATIONS.items():
             if not insp.has_table(table):
@@ -243,8 +270,37 @@ def _migrate() -> None:
             have = {c["name"] for c in insp.get_columns(table)}
             for name, ddl in cols:
                 if name not in have:
-                    con.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
-        if insp.has_table("predictions") and engine.dialect.name == "postgresql":
+                    # The DDL is written once per column and has to be valid on
+                    # both engines this project supports: SQLite spells the
+                    # timestamp type DATETIME, Postgres spells it TIMESTAMP.
+                    # Passing the SQLite spelling to Postgres fails with
+                    # `type "datetime" does not exist`.
+                    col_type = ddl.replace("DATETIME", "TIMESTAMP") if is_pg else ddl
+                    con.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}"))
+                    added.add(f"{table}.{name}")
+
+        if "games.origin" in added:
+            # Backfill, not just a default. The column default labels every
+            # pre-existing row 'carousel', but ~496 of them are not: they were
+            # discovered via YouTube and never once appeared in a carousel.
+            # Left as 'carousel' they would slip into the market sample the
+            # week-2 comparison depends on being unchanged.
+            #
+            # "Has no snapshots" identifies them exactly - collect() writes a
+            # snapshot in the same transaction that creates a game from a
+            # carousel, so a carousel game cannot lack history. Guarded on
+            # first-add so a second migration pass can never reclassify a game
+            # that is merely waiting for its first snapshot.
+            con.execute(text(
+                "UPDATE games SET origin = 'orphan' "
+                "WHERE NOT EXISTS (SELECT 1 FROM snapshots s "
+                "                  WHERE s.universe_id = games.universe_id)"))
+            con.execute(text("UPDATE games SET origin = 'carousel' WHERE origin IS NULL"))
+
+        if insp.has_table("games") and is_pg:
+            con.execute(text(
+                "ALTER TABLE games ALTER COLUMN origin SET DEFAULT 'carousel'"))
+        if insp.has_table("predictions") and is_pg:
             _install_settled_guard(con)
 
 

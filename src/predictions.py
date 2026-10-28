@@ -53,13 +53,47 @@ MIN_BASELINE_CCU = 500
 # you want to test against, not by how tidy the number looks.
 
 
+# Whether games discovered outside the Roblox carousels (`games.origin =
+# 'orphan'`) count toward the market median and the base rate.
+#
+# False until the week-2 comparison is finished, and the reason is measurement,
+# not quality. Orphans are on average smaller than carousel games (measured
+# 2026-10-28: median 116 CCU across all orphans, 1812 among those above the 500
+# floor, against a carousel market median of ~3000-4000). Dropping 161 such
+# games into the sample moves the median of per-game growth - the yardstick
+# both the 20 pp bar and `universe_share_over_20pp` are measured against - and
+# the verdicts would then be produced under a different ruler than week 1's.
+# The one thing week 2 exists to test, "did the new selection rule help", would
+# become unanswerable.
+#
+# They are still collected (collect.collect_orphans), so their history starts
+# accumulating now and can be applied retroactively: `origin` lives on the game,
+# not baked into each snapshot, so flipping this constant recomputes every past
+# window correctly with no backfill and no data loss.
+INCLUDE_ORPHANS_IN_METRICS = False
+
+
+def _orphan_uids(s) -> set[int]:
+    """Games to exclude from market medians and base rates, right now."""
+    if INCLUDE_ORPHANS_IN_METRICS:
+        return set()
+    from db import Game
+    return {uid for (uid,) in
+            s.query(Game.universe_id).filter(Game.origin == "orphan").all()}
+
+
 def _snapshots_pivots() -> tuple[pd.DataFrame, pd.Series]:
     """CCU by game over time, plus the market median per snapshot."""
     with Session() as s:
         rows = s.query(Snapshot.universe_id, Snapshot.ts, Snapshot.playing).all()
+        drop = _orphan_uids(s)
     df = pd.DataFrame(rows, columns=["universe_id", "ts", "playing"])
     if df.empty:
         return pd.DataFrame(), pd.Series(dtype=float)
+    if drop:
+        df = df[~df["universe_id"].isin(drop)]
+        if df.empty:
+            return pd.DataFrame(), pd.Series(dtype=float)
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     piv = (df.pivot_table(index="ts", columns="universe_id",
                           values="playing", aggfunc="last").sort_index())
@@ -535,6 +569,13 @@ def _market_change(s, base_at, now_at, min_games: int = 20) -> tuple[float | Non
     if not base_ts or not now_ts:
         return None, 0
 
+    # Same exclusion as the base rate, for the same reason: the median of
+    # per-game ratios IS the ruler a "beat the market" verdict is measured
+    # against. Mixing a differently-sized population into one half of the
+    # comparison and not the other would be the ratio-of-medians bias again,
+    # wearing a different hat.
+    drop = _orphan_uids(s)
+
     def _avg_per_game(ticks: list) -> dict[int, float]:
         rows = (s.query(Snapshot.universe_id, Snapshot.playing)
                  .filter(Snapshot.ts.in_(ticks))
@@ -542,6 +583,8 @@ def _market_change(s, base_at, now_at, min_games: int = 20) -> tuple[float | Non
                  .filter(Snapshot.playing > 0).all())
         acc: dict[int, list] = {}
         for uid, val in rows:
+            if uid in drop:
+                continue
             acc.setdefault(uid, []).append(val)
         return {uid: float(np.mean(v)) for uid, v in acc.items()}
 
