@@ -101,7 +101,21 @@ jobs:
       # model and embeds every unmatched title, so it runs on a minority of
       # ticks. With 8 runs/day, hours divisible by 3 give exactly 2 full passes
       # (00:00 and 12:00 UTC) and 6 cheap ones.
+      # Capped at 12 minutes and allowed to fail without killing the run.
+      #
+      # Run #83 was cancelled at the job's 35-minute ceiling with this step at
+      # 32.4 minutes - and because a timeout cancels the whole job, every step
+      # after it was skipped: no digest, no forecast record, no resolve. A slow
+      # YouTube poll silently cost a full day of forecasts. The work itself is
+      # resumable (unmatched titles stay queued, `due.py` only marks the pass
+      # complete on success), so giving this step time to finish is worth less
+      # than guaranteeing the steps below always run.
+      #
+      # continue-on-error means a timeout or a transient YouTube failure leaves
+      # `youtube_full` unmarked, so the next tick retries it.
       - name: Collect YouTube
+        continue-on-error: true
+        timeout-minutes: 12
         run: |
           if python src/due.py youtube_full 11; then
             python src/youtube_collect.py && python src/due.py mark youtube_full
@@ -114,6 +128,8 @@ jobs:
       # real quota (1,100 units/run), so twice a day with a hard budget.
       # Without YT_API_KEY it exits immediately and RSS carries on.
       - name: YouTube discovery (API)
+        continue-on-error: true
+        timeout-minutes: 10
         run: |
           if python src/due.py yt_discovery 11; then
             python src/yt_discovery.py --budget 1200 && python src/due.py mark yt_discovery

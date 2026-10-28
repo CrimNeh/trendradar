@@ -73,6 +73,58 @@ DISCOVERY_QUERIES = {
 
 MAX_NEW_GAMES_PER_RUN = 25
 
+# Ceiling on titles sent through the semantic pass in one run.
+#
+# Run #83 (2026-10-28 16:00) was cancelled at the job's 35-minute timeout with
+# `Collect YouTube` sitting at 32.4 minutes, after which the digest, the
+# forecast record and the resolve all skipped. The cause was volume, not a bug:
+# 16814 videos arrived in that 12h window against 4815 the day before (3.5x),
+# and this pass embedded every unmatched title with no cap. 19842 videos in the
+# table have no mention, so a busy window is unbounded work.
+#
+# The pass is opportunistic - it re-runs whenever `youtube_full` is due, and
+# anything left unembedded stays in `pending` for the next tick, because a
+# title only drops out of the queue once it gets a mention. So cutting the
+# batch loses nothing; it just spreads the same work over more runs.
+#
+# 4000 is chosen to keep the pass near ~4 minutes at the rate measured against
+# this table (roughly 60ms/title including the index build), leaving the rest
+# of the budget for the steps that actually produce the page and the ledger.
+MAX_EMBED_PER_RUN = int(os.environ.get("YT_MAX_EMBED", "4000"))
+
+# Nothing older than this can be evidence of what is trending NOW.
+#
+# Two separate reasons, both measured:
+#
+# 1. They are not evidence. The queue held 4266 videos older than 30 days (up
+#    to 1915 days) carrying the highest raw view counts, purely because they
+#    have had years to accumulate. Ranking by popularity without an age floor
+#    promoted a 520-day-old Minecraft animation to the front of the pass. A
+#    video from last year says what happened last year.
+#
+# 2. The queue has to drain, not grow. Throughput is MAX_EMBED_PER_RUN per run
+#    and `youtube_full` fires twice a day, i.e. ~8000 videos/day. Candidate
+#    counts measured 2026-10-28: <=3d 3768, <=7d 8473, <=30d 15576. A 30-day
+#    window is larger than daily throughput, so the backlog would grow forever
+#    and every video would age in the queue while waiting its turn - a video
+#    admitted on day 25 would be matched on day 27 and the signal already
+#    stale. A 7-day window sits just above throughput, so the queue drains.
+#
+# 7 days, not 3: the 1-7 day band is 8473 - 3768 = 4705 videos and contains
+# the bulk of genuine trend evidence (a video needs a few days to accumulate
+# the views that make it worth matching). Cutting to 3 would throw that away
+# to save time the pass does not need.
+#
+# Videos outside the window stay in `yt_videos` as reference data - they are
+# not deleted, just excluded from the semantic pass.
+EMBED_MAX_AGE_DAYS = int(os.environ.get("YT_EMBED_MAX_AGE_DAYS", "7"))
+
+# When a new game enters the catalogue, already-checked videos get one more
+# chance to match it - but only this many, only this recent. See
+# _ingest_new_games() for why the bound is not optional.
+EMBED_RECHECK_DAYS = int(os.environ.get("YT_EMBED_RECHECK_DAYS", "3"))
+EMBED_RECHECK_MAX = int(os.environ.get("YT_EMBED_RECHECK_MAX", "2000"))
+
 # Concurrent RSS fetches. Measured: 150 feeds in 16 threads take 2.4 s, so the
 # network is not the bottleneck - the reason 70 channels had never been polled
 # is that the earlier run died before reaching them, not that fetching was slow.
@@ -245,18 +297,26 @@ def _record_video(s, u: dict, now, known: set | None = None,
 
 def _record_mention(s, video_id: str, m: dict, now, channel_id, lang,
                     matched: set | None = None) -> bool:
-    """Add a mention. `matched` is the preloaded (video_id -> has any) set."""
+    """Add a mention. `matched` is the preloaded (video_id, universe_id) set.
+
+    The set is what makes this cheap. The previous version did a COUNT query
+    per call and only consulted `matched` in a branch that called `pass` - so
+    the set did nothing and every mention cost a full round trip. Measured on
+    Neon: 59 ms per query, and a busy run produces thousands of matches, i.e.
+    minutes of pure latency. The set is loaded once in the caller; a miss here
+    means the pair is genuinely new, and the unique constraint still guards
+    against a duplicate slipping through a race.
+    """
     if matched is not None:
-        if video_id in matched:
-            # Already has at least one mention. It may still be a different game,
-            # but the unique constraint would reject a true duplicate anyway, so
-            # skip only when this exact pair is known.
-            pass
-    if s.query(Mention).filter(Mention.video_id == video_id,
-                               Mention.universe_id == m["universe_id"]).count():
+        key = (video_id, int(m["universe_id"]))
+        if key in matched:
+            return False
+    elif s.query(Mention).filter(Mention.video_id == video_id,
+                                 Mention.universe_id == m["universe_id"]).count():
+        # Only reached when no preloaded set was supplied.
         return False
     if matched is not None:
-        matched.add(video_id)
+        matched.add((video_id, int(m["universe_id"])))
     s.add(Mention(
         video_id=video_id, universe_id=int(m["universe_id"]), observed=now,
         containment=m.get("containment"), matched=(m.get("matched") or "")[:128],
@@ -285,7 +345,26 @@ def _parse_dt(raw: str | None):
 
 
 def _ingest_new_games(s, universe_ids: list[int]) -> int:
-    """Add games found via video links that no chart has shown us yet."""
+    """Add games found via video links that no chart has shown us yet.
+
+    When a game is genuinely new to the catalogue, videos that were already
+    looked at had nothing to match against and were marked `embed_checked`
+    anyway. Without a reset those videos can never be revisited, so the game
+    would only ever be matched against future uploads.
+
+    The reset is deliberately bounded, because an unbounded one defeats the
+    entire point of `embed_checked`:
+
+      * only on runs that actually added a game (most runs add none)
+      * only videos from the last EMBED_RECHECK_DAYS days
+      * at most EMBED_RECHECK_MAX rows, newest-viewed first
+
+    Worst case that is one extra pass over 2000 recent videos, on top of the
+    day's new arrivals - still inside the ~8000/day batch throughput. Resetting
+    the full 7-day window on every ingest (~50-130 new games a day) would refill
+    the queue to 8000 every single run and make the queue un-drainable again,
+    which is exactly the bug being fixed here.
+    """
     if not universe_ids:
         return 0
     added = 0
@@ -304,6 +383,18 @@ def _ingest_new_games(s, universe_ids: list[int]) -> int:
             created=_parse_dt(d.get("created")), updated=_parse_dt(d.get("updated")),
             niche=niche, tags=tags))
         added += 1
+
+    if added:
+        s.execute(text("""
+            update yt_videos set embed_checked = null
+            where video_id in (
+                select video_id from yt_videos
+                where embed_checked is not null
+                  and published > now() - make_interval(days => :days)
+                order by views desc nulls last
+                limit :lim
+            )
+        """), {"days": EMBED_RECHECK_DAYS, "lim": EMBED_RECHECK_MAX})
     return added
 
 
@@ -410,7 +501,12 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
         # thousands of queries.
         video_rows = {v.video_id: v for v in s.query(YtVideo).all()}
         known_videos = set(video_rows)
-        matched_videos = {v for (v,) in s.query(Mention.video_id).distinct().all()}
+        # (video_id, universe_id) pairs, not just video ids: `_record_mention`
+        # needs to know whether THIS game is already attached to THIS video, and
+        # a video can legitimately mention several games.
+        matched_pairs = {(v, int(u)) for v, u in
+                         s.query(Mention.video_id, Mention.universe_id).all()}
+        matched_videos = {v for v, _ in matched_pairs}
         stats["known_videos"] = len(known_videos)
 
         # Fetch every RSS feed BEFORE touching the database, in parallel.
@@ -469,7 +565,8 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
                         m = {"universe_id": uid, "method": "link",
                              "containment": 1.0, "matched": f"place:{pid}",
                              "score": 2.0}
-                        if _record_mention(s, u["video_id"], m, now, ch.channel_id, lang):
+                        if _record_mention(s, u["video_id"], m, now, ch.channel_id, lang,
+                                   matched_pairs):
                             bump(m, lang)
                         linked = True
                         break
@@ -477,14 +574,28 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
                 if linked:
                     continue
 
-                if matcher.suspicious_title(u["title"]):
-                    continue
-
-                # pass 2: game name inside the title
+                # pass 2: game name inside the title.
+                #
+                # Runs BEFORE the noise filter, and the order matters. The
+                # filter keys on words like "all", "every" and "top", which
+                # also appear in real game names - "Collect All Pets!",
+                # "All Star Tower Defense", "Clean all the Cash",
+                # "Harvest It All" are 7 games in this catalogue. Filtering
+                # first meant a video naming one of them was discarded before
+                # anything tried to match it, so those games could never
+                # receive a mention. An exact name hit is stronger evidence
+                # than a list-shaped title is evidence of noise.
                 m = matcher.best_match(u["title"], match_frame)
                 if m:
-                    if _record_mention(s, u["video_id"], m, now, ch.channel_id, lang):
+                    if _record_mention(s, u["video_id"], m, now, ch.channel_id, lang,
+                                   matched_pairs):
                         bump(m, lang)
+                    continue
+
+                # Now the compilations/rankings filter, on titles that matched
+                # no game by name - which is where list-shaped noise actually
+                # lives.
+                if matcher.suspicious_title(u["title"]):
                     continue
                 pending.append((u, lang))
             # No commit here. Committing per channel cost ~180 ms each (92
@@ -507,23 +618,144 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
                     continue
                 m = {"universe_id": uid, "method": "link", "containment": 1.0,
                      "matched": f"place:{pid}", "score": 2.0}
-                if _record_mention(s, u["video_id"], m, now, u["channel_id"], lang):
+                if _record_mention(s, u["video_id"], m, now, u["channel_id"], lang,
+                                   matched_pairs):
                     bump(m, lang)
             s.commit()
 
-        # ---- pass 3: semantic, only for what is still unmatched
-        if use_embed and pending:
+        # ---- pass 3: semantic match for what the first two passes missed
+        if use_embed:
             import embed
             if embed.available():
                 games = games_frame(s)
+                lang_of = {c.channel_id: (c.lang or "en") for c in channels}
+
+                # Queue = this run's fresh uploads PLUS the standing backlog.
+                #
+                # `pending` alone only ever held videos from the current RSS
+                # poll (~15 uploads per channel). Anything that missed its single
+                # chance was unreachable forever, because RSS never serves it
+                # again. Measured 2026-10-28: 19842 videos had no mention and
+                # 4847 of them were already older than three days - past the
+                # feed window, permanently invisible. An earlier comment here
+                # claimed they would be "picked up next run"; they were not.
+                fresh = [(u.get("views") or 0, u, lang) for u, lang in pending]
+                seen_ids = {u["video_id"] for _, u, _ in fresh}
+
+                # Queue = "not yet looked at", not "no mention".
+                #
+                # "No mention" made the queue un-drainable: a video matching
+                # nothing never gains a mention, so it returned every run until
+                # it aged out - roughly 7 redundant passes each over a 7-day
+                # window, and queue growth measured at 1.06x throughput, i.e.
+                # it would grow forever. embed_checked is stamped after the
+                # pass whether or not anything matched, so each video is
+                # processed once.
+                # Two conditions, not one.
+                #
+                # `embed_checked IS NULL` alone is not "needs embedding". A
+                # video matched by pass 1 or 2 (link / exact name) already has
+                # its game and needs no semantic pass - but `embed_checked` is
+                # only stamped for the batch pass 3 actually processed, so those
+                # videos stayed NULL and queued up as if untouched. Measured
+                # 2026-10-28: 15800 pending, of which 7320 were already matched
+                # (5404 token, 1164 link, 385 embed, 384 search) - nearly half
+                # the queue was work that could not produce anything.
+                #
+                # The NOT EXISTS makes the queue mean "unmatched and unlooked-at"
+                # regardless of whether a stamp was written, which is the
+                # property that actually matters. 15800 -> 8465.
+                rows = s.execute(text("""
+                    select v.video_id, v.title, v.channel_id, v.views, v.published
+                    from yt_videos v
+                    where v.embed_checked is null
+                      and v.published > now() - make_interval(days => :days)
+                      and not exists (select 1 from mentions m
+                                      where m.video_id = v.video_id)
+                    order by v.views desc nulls last
+                    limit :lim
+                """), {"lim": MAX_EMBED_PER_RUN * 3,
+                       "days": EMBED_MAX_AGE_DAYS}).fetchall()
+
+                for vid, title, cid, views, pub in rows:
+                    if vid in seen_ids:
+                        continue
+                    seen_ids.add(vid)
+                    fresh.append((views or 0, {
+                        "video_id": vid, "title": title, "channel_id": cid,
+                        "published": pub,
+                    }, lang_of.get(cid, "en")))
+
+                # Most-significant-first, not first-come-first-served - but
+                # significance is recency-weighted, not popularity alone.
+                #
+                # The previous order was "whichever channel happened to be
+                # listed earlier", so a 10-view upload outranked a 49.9M-view
+                # one. Ranking by raw views alone is not the fix either: tried
+                # on this table it put a 520-day-old Minecraft animation and a
+                # 1915-day-old Russian short at the top, because old videos have
+                # had years to accumulate views. A trend indicator is worthless
+                # if it is two years stale.
+                #
+                # views / (age_days + 1) ** 1.5 was chosen by comparing the
+                # orderings on real data:
+                #   raw views  -> 500-day Minecraft animations first
+                #   decay only -> fresh, but still leaked unrelated shorts
+                #   30d + decay-> Roblox shorts at 3.9M-10M, all <= 13 days
+                # The window is a hard floor (nothing older than 30 days can be
+                # evidence of what is trending now) and the decay ranks inside
+                # it. 15578 videos sit in that window - 3.9x the batch - so the
+                # ceiling never truncates the pool.
+                #
+                # `views_per_hour` would be sharper still, but it is null on
+                # rows written before it was tracked and is inflated by a single
+                # viral spike, so it is not used for ordering.
+                def _rank(item):
+                    views, u, _ = item
+                    pub = u.get("published")
+                    if pub is None:
+                        return 0.0
+                    age_days = max((now - pub).total_seconds() / 86400, 0.0)
+                    return views / ((age_days + 1) ** 1.5)
+
+                before_age = len(fresh)
+                fresh = [x for x in fresh
+                         if x[1].get("published") is None
+                         or (now - x[1]["published"]).days <= EMBED_MAX_AGE_DAYS]
+                dropped_age = before_age - len(fresh)
+                fresh.sort(key=_rank, reverse=True)
+                total = len(fresh)
+                chosen = fresh[:MAX_EMBED_PER_RUN]
+                if total > len(chosen):
+                    print(f"  embed: {len(chosen)} of {total} titles "
+                          f"(limit {MAX_EMBED_PER_RUN}, rest next run)",
+                          flush=True)
+                if dropped_age:
+                    # Without this line, videos excluded by the age window
+                    # simply vanish from the counts, which reads as data loss.
+                    print(f"  embed: {dropped_age} title(s) older than "
+                          f"{EMBED_MAX_AGE_DAYS}d skipped as stale", flush=True)
+
                 idx = embed.build_index(
                     [(int(a), b) for a, b in zip(games.universe_id, games.name)],
-                    [u["title"] for u, _ in pending])
-                for u, lang in pending:
+                    [u["title"] for _, u, _ in chosen])
+                for _, u, lang in chosen:
                     m = idx.match(u["title"])
                     if m and _record_mention(s, u["video_id"], m, now,
-                                             u["channel_id"], lang):
+                                             u.get("channel_id"), lang,
+                                             matched_pairs):
                         bump(m, lang)
+
+                # One bulk UPDATE, not one per video: the row is already in
+                # memory from the query above, but 4000 individual writes on
+                # Neon would be ~4 minutes of round trips - the exact cost this
+                # whole change exists to remove.
+                if chosen:
+                    s.execute(text("""
+                        update yt_videos set embed_checked = :now
+                        where video_id = any(:ids)
+                    """), {"now": now,
+                           "ids": [u["video_id"] for _, u, _ in chosen]})
                 s.commit()
             else:
                 stats["embed"] = "skipped: fastembed not installed"

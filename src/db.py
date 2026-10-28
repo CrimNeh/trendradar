@@ -165,6 +165,21 @@ class YtVideo(Base):
     observed = Column(DateTime, default=utcnow, index=True)
     views = Column(BigInteger)
     views_per_hour = Column(Float)
+    # When the semantic pass last LOOKED at this video - set whether or not it
+    # matched anything.
+    #
+    # The queue used to be "videos with no mention", which is not a queue: a
+    # video that matches nothing keeps having no mention, so it was re-embedded
+    # on every run for as long as it stayed in the age window (about 7 wasted
+    # passes each). Measured 2026-10-28: 19842 videos with no mention, queue
+    # growth 1.06x throughput at a 7-day window - it could never drain, because
+    # the same rows kept coming back.
+    #
+    # With this column the queue is "not yet looked at", so every video is
+    # embedded once. Reset to NULL by _ingest_new_games() for recent videos
+    # when a NEW game enters the catalogue, so a video processed before its
+    # game existed still gets one more chance against it.
+    embed_checked = Column(DateTime, index=True)
 
 
 class Mention(Base):
@@ -233,6 +248,7 @@ _MIGRATIONS = {
     # orphan_checked tracks the last sweep, so a permanently-tiny game is asked
     # about once a day instead of on all 8 runs.
     "games": [("origin", "VARCHAR(16) DEFAULT 'carousel'"), ("orphan_checked", "DATETIME")],
+    "yt_videos": [("embed_checked", "DATETIME")],
 }
 
 
@@ -278,6 +294,46 @@ def _migrate() -> None:
                     col_type = ddl.replace("DATETIME", "TIMESTAMP") if is_pg else ddl
                     con.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {col_type}"))
                     added.add(f"{table}.{name}")
+
+        if insp.has_table("yt_videos") and "embed_checked" in {
+                c["name"] for c in insp.get_columns("yt_videos")}:
+            # Already-matched videos are NOT queue work: pass 1/2 already found
+            # their game, so a semantic pass over them cannot add anything. They
+            # stayed NULL only because the stamp is written by pass 3, which
+            # never sees them. Without this update roughly half the reported
+            # backlog (7320 of 15800 on 2026-10-28) is work that cannot produce
+            # a result, which makes the queue look twice as deep as it is and
+            # starves the videos that do need matching.
+            #
+            # Idempotent: only touches rows that are both unstamped and already
+            # matched. Matches the NOT EXISTS guard in the queue query, so the
+            # stamp and the query can never disagree about what "pending" means.
+            con.execute(text(
+                "UPDATE yt_videos SET embed_checked = CURRENT_TIMESTAMP "
+                "WHERE embed_checked IS NULL AND EXISTS "
+                "  (SELECT 1 FROM mentions m WHERE m.video_id = yt_videos.video_id)"))
+            # Backfill the already-stale rows as "checked", so the queue means
+            # exactly "still pending" and not "pending forever".
+            #
+            # 17162 videos were older than the 7-day semantic window when this
+            # column appeared. They can never be selected (the queue query
+            # filters on published), so leaving them NULL would make every
+            # count of the backlog permanently inflated by rows that no run will
+            # ever consume - and a backlog that cannot be measured cannot be
+            # shown to be draining.
+            #
+            # Only the genuinely stale ones: recent videos stay NULL so they
+            # get their first real pass.
+            # Idempotent by construction: only ever stamps rows that are both
+            # NULL and already outside the window, so a second run finds
+            # nothing to do. It runs on every migration rather than only on
+            # first column creation, because the first attempt can miss (the
+            # column may have been added by an earlier run before this
+            # backfill existed - which is exactly what happened on 2026-10-28).
+            con.execute(text(
+                "UPDATE yt_videos SET embed_checked = CURRENT_TIMESTAMP "
+                "WHERE embed_checked IS NULL AND published IS NOT NULL "
+                "  AND published <= CURRENT_TIMESTAMP - INTERVAL '7 days'"))
 
         if "games.origin" in added:
             # Backfill, not just a default. The column default labels every
