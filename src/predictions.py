@@ -762,6 +762,7 @@ def score() -> dict:
             "baseline": r.baseline, "outcome_value": r.outcome_value,
             "benchmark": r.benchmark, "score": r.score, "r2": r.r2,
             "made_at": r.made_at, "ruleset_version": r.ruleset_version,
+            "threshold_pp": r.threshold_pp,
         } for r in rows]
 
     if not settled:
@@ -831,29 +832,68 @@ def score() -> dict:
         out["baseline_up_share_pct"] = round(float((game_chg >= 0).mean()) * 100, 1)
 
     # What a strategy of "pick any game" would score: the share of ALL
-    # comparable games that clear the same bar. This is the number the hit rate
-    # has to beat, and without it a hit rate is uninterpretable.
-    #
-    # Computable only once history covers the horizon, so before the first week
-    # it is absent rather than zero - a zero here would read as "nothing ever
-    # clears the bar", which is a different and false statement.
+    # comparable games that clear a given bar, computed once here at a few
+    # fixed round numbers (10/20/30 pp) for context on the page and in
+    # `report`. This is NOT what `edge_vs_base_rate_pp` below uses per
+    # version - see `by_ruleset` for the number that is actually comparable
+    # to a version's own hit rate.
     samp = excess_samples(horizon_days=7)
     if not samp.empty:
         out["universe_games"] = int(samp["universe_id"].nunique())
         for thr in (10, 20, 30):
             share = float((samp["excess_pp"] >= thr).mean()) * 100
             out[f"universe_share_over_{thr}pp"] = round(share, 1)
-        # Paired explicitly next to hit_rate_pct so a reader cannot cite one
-        # without seeing the other. "27% hit rate" means nothing alone; next
-        # to "20% of ALL comparable games clear the same bar with no model at
-        # all" it reads as a +7pp edge over picking at random, which is the
-        # actual claim being tested. hit_rate_pct counts partial as 0.5 while
-        # this base rate is binary (>=20pp or not), so the two are not on
-        # exactly the same scale - the comparison is a sanity check, not a
-        # formal test.
         if "universe_share_over_20pp" in out:
+            # Kept for backward compatibility with anything reading this key
+            # directly, but it silently assumes every settled row used a 20 pp
+            # bar. True for ruleset_version 2 (the only version that exists so
+            # far); see the caveat on `by_ruleset` below for why this breaks
+            # the moment a second version appears.
             out["edge_vs_base_rate_pp"] = round(
                 out["hit_rate_pct"] - out["universe_share_over_20pp"], 1)
+
+    # Per-version breakdown. The reason this exists: `hit_rate_pct` above pools
+    # every settled row regardless of which threshold judged it, and
+    # `edge_vs_base_rate_pp` always compares against a 20 pp base rate no
+    # matter what `threshold_pp` a row actually carried. Both are silently
+    # correct only as long as every row in the table was judged by the same
+    # rule - true today (only ruleset_version 2 exists), false the moment a
+    # changed PLANS or a re-derived threshold_pp produces a version 3 row.
+    #
+    # Without this, a week-3 comparison against week-1/2 would either mix two
+    # different exam questions into one "hit rate" (if read from the top-level
+    # keys) or silently grade week-3 rows against week-1's base rate (if
+    # `edge_vs_base_rate_pp` is read without checking which threshold applies).
+    # Both failure modes were caught before any version 3 row existed, which is
+    # the point: the breakdown is in place before it is needed, not patched in
+    # after the first wrong comparison gets published.
+    by_rv: dict[str, dict] = {}
+    for rv, grp in df.groupby("ruleset_version", dropna=False):
+        rv_key = str(int(rv)) if pd.notna(rv) else "unknown"
+        entry = {
+            "n": int(len(grp)),
+            "hit_rate_pct": round(float(grp["hit_num"].mean()) * 100, 1),
+        }
+        # The base rate for THIS version's own bar, not a hardcoded 20. Rows
+        # written before threshold_pp existed carry None; those are reported
+        # without a base rate rather than guessed at 20, which would silently
+        # resurrect the exact bug this breakdown exists to prevent.
+        bars = grp["threshold_pp"].dropna().unique()
+        if len(bars) == 1 and not samp.empty:
+            bar = float(bars[0])
+            base = float((samp["excess_pp"] >= bar).mean()) * 100
+            entry["threshold_pp"] = round(bar, 1)
+            entry["base_rate_pct"] = round(base, 1)
+            entry["edge_vs_base_rate_pp"] = round(entry["hit_rate_pct"] - base, 1)
+        elif len(bars) > 1:
+            # A version that somehow mixes bars (e.g. threshold_pp was
+            # re-derived mid-version without bumping CURRENT_RULESET_VERSION)
+            # cannot get one honest base rate. Surfacing the mixed bars is
+            # more useful than averaging them into a number that matches no
+            # row in the group.
+            entry["threshold_pp_mixed"] = sorted(float(b) for b in bars)
+        by_rv[rv_key] = entry
+    out["by_ruleset"] = by_rv
 
     conf = df.dropna(subset=["confidence"]).copy()
     if len(conf) >= 5:
