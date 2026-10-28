@@ -207,7 +207,7 @@ _MIGRATIONS = {
     # re-fetch raw snapshots and refit the regression by hand. Store it next
     # to the forecast it was computed for, so the question is answerable with
     # one query instead of a script.
-    "predictions": [("r2", "FLOAT")],
+    "predictions": [("r2", "FLOAT"), ("ruleset_version", "INTEGER DEFAULT 2")],
 }
 
 
@@ -244,6 +244,61 @@ def _migrate() -> None:
             for name, ddl in cols:
                 if name not in have:
                     con.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+        if insp.has_table("predictions") and engine.dialect.name == "postgresql":
+            _install_settled_guard(con)
+
+
+def _install_settled_guard(con) -> None:
+    """DB-level enforcement that a settled row's judging fields never change.
+
+    The docstrings in this file promised "append-only, no update path, no
+    delete path" since the table was introduced. That promise lived only in
+    application code - nothing stopped a direct UPDATE run from outside the
+    app. An external audit on 2026-10-28 found exactly that: 100 of the first
+    124 rows were set to `outcome='void'` with a hand-written reason in
+    `outcome_basis`, and at least one of them (id=11) has a `checked_at` only
+    ~1h45m after `made_at` on a 7-day-horizon row - impossible through
+    `resolve()`, which only ever judges rows whose `due_at` has passed.
+
+    This trigger makes the guarantee real: once `outcome` is non-NULL, no
+    UPDATE may change `outcome`, `outcome_value`, `outcome_basis`, `baseline`,
+    `benchmark`, `criterion`, or `threshold_pp` on that row, for any writer,
+    including the table owner (Postgres triggers fire regardless of who runs
+    the statement - only disabling or dropping the trigger bypasses this,
+    which requires DDL rights and leaves its own trace). `resolve()` never
+    needs to touch a settled row twice (it already skips rows where
+    `outcome is not None`), so this cannot break the normal path.
+    """
+    from sqlalchemy import text
+    con.execute(text("""
+        CREATE OR REPLACE FUNCTION predictions_block_settled_edit()
+        RETURNS trigger AS $$
+        BEGIN
+            IF OLD.outcome IS NOT NULL AND (
+                NEW.outcome IS DISTINCT FROM OLD.outcome OR
+                NEW.outcome_value IS DISTINCT FROM OLD.outcome_value OR
+                NEW.outcome_basis IS DISTINCT FROM OLD.outcome_basis OR
+                NEW.baseline IS DISTINCT FROM OLD.baseline OR
+                NEW.benchmark IS DISTINCT FROM OLD.benchmark OR
+                NEW.criterion IS DISTINCT FROM OLD.criterion OR
+                NEW.threshold_pp IS DISTINCT FROM OLD.threshold_pp
+            ) THEN
+                RAISE EXCEPTION
+                    'predictions: row % is settled (outcome=%); judging fields are immutable once set',
+                    OLD.id, OLD.outcome;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+    """))
+    con.execute(text("""
+        DROP TRIGGER IF EXISTS trg_predictions_block_settled_edit ON predictions;
+    """))
+    con.execute(text("""
+        CREATE TRIGGER trg_predictions_block_settled_edit
+        BEFORE UPDATE ON predictions
+        FOR EACH ROW EXECUTE FUNCTION predictions_block_settled_edit();
+    """))
 
 
 def _ensure_dir() -> None:
@@ -334,6 +389,23 @@ class Prediction(Base):
     # finding required re-fetching raw snapshots and refitting the regression
     # for every past row by hand.
     r2 = Column(Float)
+    # Which version of the selection/judging rules produced this row. Bumped
+    # whenever PLANS, _judge, or the candidate ranking changes meaningfully.
+    #
+    # Before this existed, a rule change meant either mixing old and new rows
+    # under one hit rate (wrong - they answer different questions) or voiding
+    # the old ones by hand with a prose explanation in outcome_basis. The
+    # second path is how 100 of the first 124 rows ended up void: real edits,
+    # individually justified, but applied directly to "settled" rows outside
+    # resolve() - the opposite of the append-only guarantee this table exists
+    # to provide. An external audit on 2026-10-28 traced one of them (id=11)
+    # to a checked_at only ~1h45m after made_at on a 7-day horizon, which
+    # resolve() cannot produce - proof the edit bypassed the application.
+    #
+    # Going forward: bump this constant instead of writing void+prose. Old
+    # rows stay queryable by version instead of being silently dropped from
+    # the sample.
+    ruleset_version = Column(Integer, default=2)
 
     made_at = Column(DateTime, default=utcnow, index=True, nullable=False)
     due_at = Column(DateTime, index=True, nullable=False)

@@ -171,6 +171,22 @@ def derive_threshold(percentile: int = 75, horizon_days: float = 7,
     }
 
 
+# Bumped whenever PLANS, _judge, or the candidate ranking in record_from_features
+# changes meaningfully. Written onto every new row (Prediction.ruleset_version)
+# so a future comparison can filter or group by "which rules produced this
+# number" instead of relying on prose in outcome_basis or guessing from dates.
+#
+#   1 = the pre-2026-10-22 state: void used as an ad-hoc edit mechanism during
+#       development (100 of the first 124 rows carry this history, all void).
+#   2 = due_at judging (not run-time), void->miss on charts dropout,
+#       median-of-ratios benchmark (not ratio-of-medians), ascending-trend
+#       selection (closest-to-bar instead of biggest-mover). Rows written
+#       2026-10-22 onward with the fixes from that date forward are version 2;
+#       the exact mix of fixes present differs slightly within version 2 itself
+#       (e.g. the benchmark fix landed 2026-10-28), which is a known gap - see
+#       CHANGELOG below rather than assume every v2 row is judged identically.
+CURRENT_RULESET_VERSION = 2
+
 # How each kind of forecast is judged. Deliberately blunt: a percentage move.
 # Anything softer ("became popular") cannot be scored, and a soft criterion is
 # how a forecast gets reinterpreted into a hit after the fact.
@@ -418,6 +434,7 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
                 confidence=c["confidence"],
                 cohort_rank=c["cohort_rank"],
                 r2=c.get("r2"),
+                ruleset_version=CURRENT_RULESET_VERSION,
                 due_at=utcnow() + timedelta(days=plan["horizon"]),
             ))
             made += 1
@@ -701,6 +718,7 @@ def score() -> dict:
             "kind": r.kind, "outcome": r.outcome, "confidence": r.confidence,
             "baseline": r.baseline, "outcome_value": r.outcome_value,
             "benchmark": r.benchmark, "score": r.score, "r2": r.r2,
+            "made_at": r.made_at, "ruleset_version": r.ruleset_version,
         } for r in rows]
 
     if not settled:
@@ -717,6 +735,32 @@ def score() -> dict:
         "by_kind": (df.groupby("kind")["hit_num"].mean().mul(100).round(1)
                     .to_dict()),
     }
+
+    # Settled rows made at the same moment share the same market tick and the
+    # same digest run - they are not independent trials. An external audit on
+    # 2026-10-28 traced the first 24 settled rows to 6 distinct `made_at`
+    # clusters (sizes 8/8/1/2/2/3, not 24 independent draws), which means any
+    # interval computed as if n=24 understates the true uncertainty by a
+    # large factor. Reported here so "settled: 24" is never read alone again.
+    #
+    # Rows from one run are written seconds apart in a loop, not at the exact
+    # same microsecond, so the grouping key floors made_at to the hour - ticks
+    # are >=3h apart, which is wider than any single run takes.
+    #
+    # cluster_hit_rate_range is the spread of per-cluster hit rates, which is
+    # a more honest "how much could this move" indicator than a binomial CI
+    # on the row count would give, without pretending a formal interval is
+    # warranted on this little data.
+    cluster_key = pd.to_datetime(df["made_at"]).dt.floor("h")
+    clusters = df.groupby(cluster_key)["hit_num"].mean()
+    out["n_clusters"] = int(clusters.shape[0])
+    out["rows_per_cluster"] = (df.groupby(cluster_key).size()
+                                .sort_values(ascending=False).tolist())
+    if len(clusters) >= 2:
+        out["cluster_hit_rate_range_pct"] = [
+            round(float(clusters.min()) * 100, 1),
+            round(float(clusters.max()) * 100, 1),
+        ]
 
     # How a miss happened matters as much as how many. A game that fell off the
     # charts never got the chance to grow, which is a different failure from
@@ -756,6 +800,17 @@ def score() -> dict:
         for thr in (10, 20, 30):
             share = float((samp["excess_pp"] >= thr).mean()) * 100
             out[f"universe_share_over_{thr}pp"] = round(share, 1)
+        # Paired explicitly next to hit_rate_pct so a reader cannot cite one
+        # without seeing the other. "27% hit rate" means nothing alone; next
+        # to "20% of ALL comparable games clear the same bar with no model at
+        # all" it reads as a +7pp edge over picking at random, which is the
+        # actual claim being tested. hit_rate_pct counts partial as 0.5 while
+        # this base rate is binary (>=20pp or not), so the two are not on
+        # exactly the same scale - the comparison is a sanity check, not a
+        # formal test.
+        if "universe_share_over_20pp" in out:
+            out["edge_vs_base_rate_pp"] = round(
+                out["hit_rate_pct"] - out["universe_share_over_20pp"], 1)
 
     conf = df.dropna(subset=["confidence"]).copy()
     if len(conf) >= 5:
