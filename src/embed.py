@@ -63,7 +63,16 @@ def _get_model():
     if _model is None:
         from fastembed import TextEmbedding
         os.makedirs(MODEL_DIR, exist_ok=True)
-        _model = TextEmbedding(MODEL_NAME, cache_dir=MODEL_DIR)
+        # threads is NOT a no-op default. Measured on this project's own CPU
+        # (2-vCPU GitHub runner, Xeon @2.60GHz): leaving it unset (ORT's
+        # "auto") cost 1.8x more wall time than pinning it to the actual core
+        # count - 114.8 ms/title vs 62.8 ms/title on a 150-title benchmark,
+        # i.e. the difference between a 4000-title pass finishing in ~4 vs
+        # ~7.6 minutes. ORT's auto-detection does not reliably land on the
+        # right thread count in a container with a cgroup CPU limit, where
+        # `os.cpu_count()` still reports the host's count correctly.
+        _model = TextEmbedding(MODEL_NAME, cache_dir=MODEL_DIR,
+                               threads=os.cpu_count() or 2)
     return _model
 
 
@@ -161,10 +170,55 @@ class Index:
 
     # ---- matching
     def match(self, title: str) -> dict | None:
-        ws = windows(title)
+        """Single-title match. Kept for callers that process one video at a
+        time; see `match_batch` for anything processing many at once - calling
+        this in a loop pays the fixed per-call overhead of the ONNX session
+        (tokenize + run + marshal) once per TITLE instead of once per BATCH.
+
+        Measured on run #84 (2026-10-28): 4000 titles matched one at a time
+        timed out past 12 minutes. The windows per title are 5-20 short
+        strings, so each `embed()` call here does real work for a few
+        milliseconds and pays session overhead for the rest - multiplied by
+        4000 calls instead of ~storage ceil(4000*12/32) = ~1500 if batched.
+        """
+        return self._score_one(windows(title))
+
+    def match_batch(self, titles: list[str]) -> list[dict | None]:
+        """Match many titles with embed() called a small, fixed number of
+        times instead of once per title.
+
+        All windows from all titles are embedded in ONE call (internally
+        chunked at 32 by `embed()`), then scored per title by slicing the
+        result. The scoring itself (two matrix multiplies per title) is
+        identical to calling `match()` in a loop - only the number of ONNX
+        invocations changes, from len(titles) down to
+        ceil(total_windows / 32).
+        """
+        if not len(self.vecs):
+            return [None] * len(titles)
+        per_title_windows = [windows(t) for t in titles]
+        flat: list[str] = []
+        bounds: list[tuple[int, int]] = []
+        for ws in per_title_windows:
+            start = len(flat)
+            flat.extend(ws)
+            bounds.append((start, len(flat)))
+        if not flat:
+            return [None] * len(titles)
+        e_all = embed(flat)
+        out: list[dict | None] = []
+        for ws, (start, end) in zip(per_title_windows, bounds):
+            if start == end:
+                out.append(None)
+                continue
+            out.append(self._score_one(ws, e_all[start:end]))
+        return out
+
+    def _score_one(self, ws: list[str], e: np.ndarray | None = None) -> dict | None:
         if not ws or not len(self.vecs):
             return None
-        e = embed(ws)
+        if e is None:
+            e = embed(ws)
         s = 2.0 * (e @ self.vecs.T) - self.hub[None, :]
         # Latin-only windows with a single word are never accepted here.
         for i, w in enumerate(ws):

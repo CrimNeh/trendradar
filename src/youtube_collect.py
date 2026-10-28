@@ -739,8 +739,20 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
                 idx = embed.build_index(
                     [(int(a), b) for a, b in zip(games.universe_id, games.name)],
                     [u["title"] for _, u, _ in chosen])
-                for _, u, lang in chosen:
-                    m = idx.match(u["title"])
+
+                # match_batch(), not match() in a loop. Run #84 timed out at
+                # 12 minutes with 4000 titles matched one at a time - each
+                # call to embed() pays the ONNX session's fixed per-call
+                # overhead (tokenize + run + marshal) regardless of how little
+                # work it does, and a title's windows are only 5-20 short
+                # strings. match_batch sends every window from every title
+                # through embed() in one shot (chunked at 32 internally), so
+                # the number of ONNX calls drops from len(chosen) to
+                # ceil(total_windows / 32) - roughly 1500 instead of 4000, and
+                # the scoring math per title is unchanged.
+                titles = [u["title"] for _, u, _ in chosen]
+                matches = idx.match_batch(titles)
+                for (_, u, lang), m in zip(chosen, matches):
                     if m and _record_mention(s, u["video_id"], m, now,
                                              u.get("channel_id"), lang,
                                              matched_pairs):

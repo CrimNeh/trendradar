@@ -91,6 +91,29 @@ jobs:
           path: data/models
           key: emb-model-v1
 
+      # The semantic index (data/emb_cache.npz: one vector per game + the
+      # hubness pool) is NOT in git - it is derived data, and `data/` is
+      # gitignored for exactly that reason. But it was also missing from
+      # Actions cache, so every run rebuilt it from zero: `sync_games()` saw
+      # an empty `uids` set and re-embedded all ~1200 games plus a fresh
+      # 1500-window hubness pool before matching a single video title. That
+      # is pure waste on every run except the very first.
+      #
+      # actions/cache cannot overwrite an existing key, so the key must be
+      # unique per run (github.run_id) with restore-keys falling back to the
+      # most recent prior save - the usual "always save, restore nearest"
+      # pattern for caches whose content changes every run. A stale restore
+      # is harmless: `sync_games()` only ADDS games it has not seen, so an
+      # old cache just means slightly more re-embedding this run, never wrong
+      # matches.
+      - name: Cache semantic index
+        uses: actions/cache@v5
+        with:
+          path: data/emb_cache.npz
+          key: emb-index-${{ github.run_id }}
+          restore-keys: |
+            emb-index-
+
       - name: Create schema
         run: python src/db.py
 
