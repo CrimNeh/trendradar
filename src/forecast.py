@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
-from db import Game, OriginSignal, Session  # noqa: E402
+from db import Game, OriginSignal, Session, utcnow  # noqa: E402
 from link import GENRE_MAP  # noqa: E402
 
 # Beyond this the premiere is too far out to act on today.
@@ -75,15 +75,34 @@ def upcoming_anime(counts: dict[str, int]) -> list[dict]:
     with Session() as s:
         rows = s.query(OriginSignal).filter(OriginSignal.source == "anime").all()
 
+    now = utcnow()
     out = []
     for r in rows:
         m = _meta(r.meta)
-        days = m.get("days_to_premiere")
+        days_at_observe = m.get("days_to_premiere")
         pop = m.get("popularity") or 0
-        if days is None or days > HORIZON_DAYS or pop < MIN_ANIME_POP:
+        if days_at_observe is None or pop < MIN_ANIME_POP:
             continue
-        if days < 0:
-            continue   # already aired, the wave has passed
+
+        # `days_to_premiere` is frozen at the moment origins.py collected this
+        # row - it is "days to premiere AS OF `observed`", not "as of now".
+        # AniList only lists NOT_YET_RELEASED titles, so once a title airs it
+        # drops out of that feed and upsert() stops touching its row - the
+        # frozen number then sits forever, which is how "Cyberpunk:
+        # Edgerunners 2" stayed at "0 дн" for 9 days after it had already
+        # aired. Re-deriving the actual premiere date from `observed` and
+        # measuring against `now` on every render fixes stale rows without
+        # needing origins.py to re-collect them. `observed` is naive UTC (see
+        # db.utcnow), same as `now` here - do not mix in timezone-aware
+        # datetimes or the subtraction raises.
+        observed = r.observed or now
+        premiere_at = observed + pd.Timedelta(days=days_at_observe)
+        days = (premiere_at - now).days
+
+        if days > HORIZON_DAYS:
+            continue
+        if days < -3:
+            continue   # aired a few days ago - the wave has passed
 
         genres = m.get("genres") or []
         niches = _niches_for(genres)
@@ -126,10 +145,19 @@ def platform_changes(limit: int = 10) -> list[dict]:
 
     out = []
     seen: set[str] = set()
+    now = utcnow()
     for r in rows:
         m = _meta(r.meta)
-        days = m.get("days_old")
-        if days is None or days > 45:
+        days_at_observe = m.get("days_old")
+        if days_at_observe is None:
+            continue
+        # Same staleness bug as upcoming_anime: `days_old` is frozen at
+        # collection time. A DevForum post seen once and never re-fetched
+        # (it drops off the RSS feed after a day or so) would say "5 дн
+        # назад" forever instead of counting up. Re-derive from `observed`.
+        observed = r.observed or now
+        days = days_at_observe + max(0, int((now - observed).total_seconds() // 86400))
+        if days > 45:
             continue
         # Release notes arrive every week and say little; skip them.
         low = (r.title or "").lower()
