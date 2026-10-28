@@ -103,9 +103,27 @@ def excess_samples(horizon_days: float = 7,
         if abs((t1 - t0) - horizon) > tol:
             continue
         a, b = piv.loc[t0], piv.loc[t1]
-        if med[t0] <= 0:
+
+        # Market change = the MEDIAN OF EACH GAME'S OWN ratio from t0 to t1,
+        # not the ratio of the two median snapshots (med[t1]/med[t0]).
+        #
+        # Those are different quantities whenever games enter or leave the
+        # matched set between t0 and t1, which happens on every tick here -
+        # the carousel composition shifts. By Jensen's inequality the ratio
+        # of medians is biased upward whenever the underlying ratios are
+        # right-skewed, which CCU growth always is (many flat/declining games,
+        # a few that multiply). Measured on this project's own snapshots: the
+        # two methods disagreed by a mean of +4.8 pp and up to +24.5 pp across
+        # 15 sampled windows, and changed the hit/miss verdict on 6 of the
+        # first 21 settled forecasts (29%) - always in the same direction,
+        # always making the bar harder to clear. Median-of-ratios is the
+        # unbiased version of "did a typical game grow this much".
+        both = a.index[(a > 0) & b.notna()]
+        if len(both) < 20:
             continue
-        market_change = med[t1] / med[t0] - 1
+        ratios = (b[both] / a[both]).to_numpy(dtype=float)
+        market_change = float(np.median(ratios)) - 1.0
+
         for uid in piv.columns:
             a0, b0 = a.get(uid), b.get(uid)
             if pd.isna(a0) or pd.isna(b0) or a0 < min_ccu:
@@ -274,7 +292,31 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
         # Match the page exactly. The page renders RISING_CARDS cards; writing
         # more than that would put games into the sample that nobody was shown.
         import digest_html as D
-        rows = rows.sort_values("trend", ascending=False)
+
+        # PROVISIONAL, set 2026-10-28 after the first 24 forecasts settled.
+        # The original rule picked the LARGEST moves first, on the assumption
+        # that a bigger move is a stronger signal. Measured on those 24:
+        # Spearman(trend, hit) = -0.36 - the biggest movers missed more than
+        # they hit (46% hit rate below the trend median vs 8% above it). r2
+        # (how cleanly the growth line fits) pointed the other way, weakly
+        # (+0.17). Read together: a game at the top of a spike scores a huge
+        # trend number right when it is least likely to still be climbing by
+        # the time the horizon closes, which is the "launch spike, then
+        # reversion" pattern the external audit flagged and n=24 now shows
+        # directly on this project's own data - not a reason to trust it
+        # blindly, but a reason to stop selecting for the opposite of what
+        # the first week measured.
+        #
+        # So: rank candidates by PROXIMITY to the qualifying bar (ascending
+        # trend) instead of by the size of the move, with r2 descending as
+        # the tie-break. This changes what gets RECORDED as a forecast, not
+        # what the digest page shows - the page still lists the biggest
+        # movers, which is a legitimate "what happened" view independent of
+        # whether that is a good forecast ranking.
+        #
+        # n=24 is small. Re-check this sort once week 2 settles (~2026-11-04)
+        # and revert to descending if the direction does not hold.
+        rows = rows.sort_values(["trend", "r2"], ascending=[True, False])
         rows = rows.head(min(top_n, D.RISING_CARDS))
 
         # The digest already drops games below its own MIN_CCU inside
@@ -306,6 +348,7 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
             "confidence": _blend_confidence(
                 conf_by_uid.get(int(r["universe_id"])), r.get("r2")),
             "cohort_rank": r.get("cohort_rank"),
+            "r2": r.get("r2"),
         } for r in rows.to_dict("records")]
     else:
         from features import build_features
@@ -374,6 +417,7 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
                 score=c["score"],
                 confidence=c["confidence"],
                 cohort_rank=c["cohort_rank"],
+                r2=c.get("r2"),
                 due_at=utcnow() + timedelta(days=plan["horizon"]),
             ))
             made += 1
@@ -393,15 +437,19 @@ def due_forecasts() -> list[dict]:
             "subject": r.subject, "metric": r.metric, "baseline": r.baseline,
             "criterion": r.criterion, "claim": r.claim, "due_at": r.due_at,
             "threshold_pp": r.threshold_pp,
+            # Needed to compute the market's own change over the SAME window
+            # the forecast covers (made_at -> due_at), not "whatever the
+            # market is doing right now".
+            "made_at": r.made_at,
         } for r in rows]
 
 
 def _market_median_ccu(s, at) -> float | None:
-    """Market median CCU at a point in time.
+    """Market median CCU at a single point in time. Display/debug only.
 
-    The benchmark a "grows faster than the market" claim is measured against.
-    Without it, a forecast about relative growth is being graded on an absolute
-    number, which measures the market instead of the game.
+    Used to populate `benchmark` when a forecast is recorded, as a reference
+    value a human can read next to the row. NOT used to judge "beat the
+    market" claims any more - see `_market_change` for that.
     """
     from sqlalchemy import func
     ts = (s.query(func.max(Snapshot.ts))
@@ -419,14 +467,88 @@ def _market_median_ccu(s, at) -> float | None:
     return float(vals[mid]) if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
 
 
+def _snapshot_ticks_at_or_before(s, at, n: int) -> list:
+    """Up to `n` distinct snapshot timestamps at or before `at`, newest first."""
+    rows = (s.query(Snapshot.ts).filter(Snapshot.ts <= at)
+             .distinct().order_by(Snapshot.ts.desc()).limit(n).all())
+    return [r[0] for r in rows]
+
+
+def _market_change(s, base_at, now_at, min_games: int = 20) -> tuple[float | None, int]:
+    """How much a TYPICAL game grew from base_at to now_at, as a fraction.
+
+    This replaces the old method of comparing two market-median SNAPSHOTS
+    (median_now - median_base) / median_base, which is not the same question
+    as "how much did a typical game grow" and is biased toward overstating
+    market growth whenever growth is right-skewed - which CCU growth always
+    is (a few games multiply, most are flat or shrink, so the median of the
+    later snapshot is pulled up by games that were not even in the earlier
+    one, and the Jensen's-inequality gap between ratio-of-medians and
+    median-of-ratios is not zero).
+
+    Measured on this project's own history: the two methods disagreed by a
+    mean of +4.8 pp and up to +24.5 pp across 15 sampled week-long windows,
+    and the old method changed the hit/miss verdict on 6 of the first 21
+    settled forecasts (29%) - always toward "harder to beat", never the
+    other way.
+
+    This function instead computes, per game present at both ends, its own
+    ratio value_at(now)/value_at(base), and returns the MEDIAN of those
+    per-game ratios, using the single nearest snapshot tick at each end (same
+    matching rule `_value_now_fresh` uses, so both halves of the comparison
+    are built the same way).
+
+    An earlier version averaged a trailing window of ticks at each end to
+    damp day/night noise (the market median point-sample swings between
+    ~3000 and ~5200 over a week). That was reverted: averaging a window
+    ending at base_at and a window ending at now_at does not sample the same
+    phase of the daily cycle unless the two endpoints happen to fall at the
+    same hour, so the smoothing quietly swapped one bias (ratio-of-medians)
+    for another (uncontrolled time-of-day mismatch) - checked by replaying it
+    against the 24 settled forecasts, where it moved the verdict on 9 of them
+    versus 6 for the single-tick fix alone. The point-sample volatility is a
+    real, separate problem; it needs same-hour matching or a longer baseline,
+    not a trailing average, and is left open rather than papered over.
+
+    Returns (change_fraction, n_games_used). change_fraction is None when
+    fewer than `min_games` games can be matched at both ends.
+    """
+    base_ts = _snapshot_ticks_at_or_before(s, base_at, 1)
+    now_ts = _snapshot_ticks_at_or_before(s, now_at, 1)
+    if not base_ts or not now_ts:
+        return None, 0
+
+    def _avg_per_game(ticks: list) -> dict[int, float]:
+        rows = (s.query(Snapshot.universe_id, Snapshot.playing)
+                 .filter(Snapshot.ts.in_(ticks))
+                 .filter(Snapshot.playing.isnot(None))
+                 .filter(Snapshot.playing > 0).all())
+        acc: dict[int, list] = {}
+        for uid, val in rows:
+            acc.setdefault(uid, []).append(val)
+        return {uid: float(np.mean(v)) for uid, v in acc.items()}
+
+    a = _avg_per_game(base_ts)
+    b = _avg_per_game(now_ts)
+    common = [u for u in a if u in b]
+    if len(common) < min_games:
+        return None, len(common)
+    ratios = np.array([b[u] / a[u] for u in common], dtype=float)
+    return float(np.median(ratios)) - 1.0, len(common)
+
+
 def _judge(criterion: str, base: float, now: float,
-           market_base: float | None = None,
-           market_now: float | None = None,
+           market_change: float | None = None,
            threshold_pp: float | None = None) -> tuple[str, str]:
     """Apply the criterion exactly as written. No judgement calls.
 
     `threshold_pp` is the frozen bar stored on the row. It is never recomputed
     here: a criterion whose bar can move is not a criterion.
+
+    `market_change` is the market's own fractional change over the SAME
+    window the forecast covers, as computed by `_market_change` (median of
+    per-game ratios, not a ratio of two median snapshots - see that
+    function's docstring for why the distinction changes verdicts).
     """
     # nan slips past `base <= 0` because comparisons with nan are always False.
     # Without this check a corrupt row scores as a miss instead of a void.
@@ -439,9 +561,8 @@ def _judge(criterion: str, base: float, now: float,
 
     if criterion.startswith("beat_market"):
         # Relative: how much the game outgrew the market itself.
-        if not market_base or not market_now or market_base <= 0:
+        if market_change is None:
             return "void", "нет медианы рынка для сравнения"
-        market_change = (market_now - market_base) / market_base
         excess = change - market_change
         basis = (f"игра {change*100:+.0f}%, рынок {market_change*100:+.0f}%, "
                  f"разница {excess*100:+.0f} пп")
@@ -543,15 +664,15 @@ def resolve() -> dict:
                 stats["checked"] += 1
                 continue
 
-            # Market median must be read at the game's own snapshot time, not
-            # at "now". If a game's last observation is 30 hours old and the
-            # market figure is from this minute, the two windows being compared
-            # have different lengths and the excess is not a difference of like
-            # with like.
-            market_now = _market_median_ccu(s, snapshot_ts)
+            # Market change over the SAME window the forecast covers
+            # (made_at -> the game's own snapshot time), computed as the
+            # median of each game's own growth ratio - not two point-in-time
+            # medians compared to each other. See `_market_change` docstring:
+            # the old method was biased toward a harder bar, and changed the
+            # verdict on 29% of the first 21 settled forecasts.
+            market_change, n_mkt = _market_change(s, p["made_at"], snapshot_ts)
             verdict, basis = _judge(p["criterion"], p["baseline"], now_val,
-                                    row.benchmark, market_now,
-                                    row.threshold_pp)
+                                    market_change, p["threshold_pp"])
             row.outcome = verdict
             row.outcome_value = now_val
             row.outcome_basis = basis[:256]
@@ -579,7 +700,7 @@ def score() -> dict:
         settled = [{
             "kind": r.kind, "outcome": r.outcome, "confidence": r.confidence,
             "baseline": r.baseline, "outcome_value": r.outcome_value,
-            "benchmark": r.benchmark,
+            "benchmark": r.benchmark, "score": r.score, "r2": r.r2,
         } for r in rows]
 
     if not settled:
@@ -646,6 +767,24 @@ def score() -> dict:
             int(k): {"hit_pct": round(v["hit_num"].mean() * 100),
                      "n": int(v["hit_num"].count())}
             for k, v in conf.groupby("bucket")}
+
+    # Self-check, not a decision rule: does the ranking signal (score=trend)
+    # or the fit quality (r2) actually relate to hitting? Added after week 1
+    # showed Spearman(trend, hit) = -0.36 on n=24 - the selection was ranking
+    # by the thing that predicted failure. Kept here so that question has an
+    # answer on every future `score` call instead of requiring a one-off
+    # script each time. n<10 is too small for the number to mean anything;
+    # shown anyway, labelled with n, so a reader is not tempted to trust it
+    # at face value before there is enough data.
+    diag = df.dropna(subset=["score", "r2"])
+    if len(diag) >= 8:
+        out["diagnostics"] = {
+            "n": int(len(diag)),
+            "spearman_trend_vs_hit": round(
+                float(diag["score"].corr(diag["hit_num"], method="spearman")), 3),
+            "spearman_r2_vs_hit": round(
+                float(diag["r2"].corr(diag["hit_num"], method="spearman")), 3),
+        }
     return out
 
 

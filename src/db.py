@@ -202,6 +202,12 @@ _MIGRATIONS = {
         # instead of being fetched every run forever.
         ("empty_polls", "INTEGER DEFAULT 0"),
     ],
+    # r2 (fit quality of the growth line) was computed every run and thrown
+    # away - every retroactive check of "does r2 predict the outcome" had to
+    # re-fetch raw snapshots and refit the regression by hand. Store it next
+    # to the forecast it was computed for, so the question is answerable with
+    # one query instead of a script.
+    "predictions": [("r2", "FLOAT")],
 }
 
 
@@ -320,6 +326,14 @@ class Prediction(Base):
     score = Column(Float)
     confidence = Column(Float)
     cohort_rank = Column(Float)
+    # Fit quality of the growth line the forecast was based on (0..1). Stored
+    # separately from `score` (the slope itself) because the two measure
+    # different things and the week-1 settlement showed they behave
+    # differently: slope correlated NEGATIVELY with hitting (-0.36 Spearman,
+    # n=24), r2 correlated weakly POSITIVELY (+0.17). Without this column that
+    # finding required re-fetching raw snapshots and refitting the regression
+    # for every past row by hand.
+    r2 = Column(Float)
 
     made_at = Column(DateTime, default=utcnow, index=True, nullable=False)
     due_at = Column(DateTime, index=True, nullable=False)
