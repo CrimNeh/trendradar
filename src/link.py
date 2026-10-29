@@ -145,8 +145,8 @@ def _load_games() -> pd.DataFrame:
     from db import Game, Session
 
     with Session() as s:
-        rows = [(g.universe_id, g.name, g.niche or "other", g.created)
-                for g in s.query(Game)]
+        rows = [(u, n, ni or "other", cr) for u, n, ni, cr in
+                s.query(Game.universe_id, Game.name, Game.niche, Game.created)]
     return pd.DataFrame(rows, columns=["universe_id", "name", "niche", "created"])
 
 

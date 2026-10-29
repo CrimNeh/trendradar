@@ -242,7 +242,8 @@ def discover_all(langs: list[str] | None = None, per_lang: int = 8) -> dict:
 
 def games_frame(s) -> pd.DataFrame:
     return pd.DataFrame(
-        [(g.universe_id, g.name, g.root_place_id) for g in s.query(Game)],
+        [(u, n, p) for u, n, p in
+            s.query(Game.universe_id, Game.name, Game.root_place_id)],
         columns=["universe_id", "name", "root_place_id"])
 
 
@@ -520,22 +521,6 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
         pending: list[tuple[dict, str]] = []
         unknown_places: dict[int, tuple[dict, str]] = {}
 
-        # Preload into memory what the per-video checks asked the database for.
-        #
-        # The old code did SELECT-per-video and COUNT-per-mention. On Neon every
-        # round trip is ~60 ms, and a run touches ~900 videos, so roughly 150 s
-        # of the runtime was network latency, not work. Two set loads replace
-        # thousands of queries.
-        video_rows = {v.video_id: v for v in s.query(YtVideo).all()}
-        known_videos = set(video_rows)
-        # (video_id, universe_id) pairs, not just video ids: `_record_mention`
-        # needs to know whether THIS game is already attached to THIS video, and
-        # a video can legitimately mention several games.
-        matched_pairs = {(v, int(u)) for v, u in
-                         s.query(Mention.video_id, Mention.universe_id).all()}
-        matched_videos = {v for v, _ in matched_pairs}
-        stats["known_videos"] = len(known_videos)
-
         # Fetch every RSS feed BEFORE touching the database, in parallel.
         #
         # The naive loop is 150 sequential HTTP calls. Measured at ~0.40 s each
@@ -544,8 +529,9 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
         # concurrent connections bring 150 channels under 5 s with no rate
         # limiting - unlike the HTML endpoints, the feed host does not throttle.
         #
-        # DB writes still happen sequentially below: SQLAlchemy sessions are not
-        # thread-safe, and the matching passes must stay ordered.
+        # This now runs BEFORE the preload, because the feeds tell us which
+        # video ids this run can possibly touch - and that set is what the
+        # preload is scoped to. See the Neon note below.
         live = [c for c in channels if c.channel_id]
         skipped = len(channels) - len(live)
         if skipped:
@@ -559,6 +545,47 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
             with ThreadPoolExecutor(max_workers=WORKERS) as ex:
                 for cid, uploads in ex.map(fetch, [c.channel_id for c in live]):
                     feeds[cid] = uploads
+
+        # Preload into memory what the per-video checks asked the database for.
+        #
+        # The old code did SELECT-per-video and COUNT-per-mention. On Neon every
+        # round trip is ~60 ms, and a run touches ~900 videos, so roughly 150 s
+        # of the runtime was network latency, not work. Two set loads replace
+        # thousands of queries.
+        #
+        # SCOPE, not just batching. These were `query(YtVideo).all()` and
+        # `query(Mention...).all()` - the whole tables, every run. Measured on
+        # Neon 2026-10-29: yt_videos is 38724 rows / 6.48 MB and mentions
+        # 15872 rows / 0.73 MB, and the run repeats 8x a day, which is 4.6 GB a
+        # month against a Neon network-transfer allowance already at 81%. The
+        # tables only grow, so that number only gets worse.
+        #
+        # Only videos that appear in TODAY'S feeds can be touched by this loop -
+        # every use of these structures is a membership test or a lookup keyed
+        # by the incoming video_id. Restricting the load to those ids keeps the
+        # behaviour identical (a miss means "not in the DB", same as before,
+        # because any row not in the candidate set was never going to be
+        # consulted) while cutting the transfer by roughly 90%: ~2-4k rows
+        # instead of 38724.
+        cand_ids = {u["video_id"] for ups in feeds.values() for u in ups}
+        stats["candidates"] = len(cand_ids)
+
+        if cand_ids:
+            video_rows = {v.video_id: v for v in s.query(YtVideo)
+                          .filter(YtVideo.video_id.in_(cand_ids))}
+            # (video_id, universe_id) pairs, not just video ids:
+            # `_record_mention` needs to know whether THIS game is already
+            # attached to THIS video, and a video can legitimately mention
+            # several games.
+            matched_pairs = {(v, int(u)) for v, u in
+                             s.query(Mention.video_id, Mention.universe_id)
+                             .filter(Mention.video_id.in_(cand_ids))}
+        else:
+            video_rows = {}
+            matched_pairs = set()
+        known_videos = set(video_rows)
+        matched_videos = {v for v, _ in matched_pairs}
+        stats["known_videos"] = len(known_videos)
 
         for ch in live:
             uploads = feeds.get(ch.channel_id, [])

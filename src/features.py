@@ -11,6 +11,7 @@ Signals combined here:
 from __future__ import annotations
 
 import os
+import pickle
 import sys
 from datetime import timedelta
 
@@ -19,21 +20,79 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 from db import Game, Mention, Session, Snapshot, YtVideo  # noqa: E402
+from sqlalchemy import text, func  # noqa: E402
 
 H = {"h6": 6 / 24, "d1": 1, "d3": 3, "d7": 7}
+
+# --- transfer budget -------------------------------------------------------
+#
+# Neon free tier allows 5 GB of network transfer per project per month. Measured
+# 2026-10-29: the run was pulling ~51 MB per tick, 8 ticks a day, i.e. 11.1 GB a
+# month - 221% of the allowance, with the project already at 81%. Two causes,
+# both fixed here:
+#
+# 1. NO TIME WINDOW. `_snapshots_df()` read the whole table every time. The
+#    table is 4.02 MB today and covers only 9.8 days, so the number grows
+#    linearly and forever: at one year of history the same query is ~150 MB, and
+#    the monthly transfer would be ~50 GB. Nothing in this module needs more
+#    than WINDOW_DAYS back - see the long note on the constant.
+#
+# 2. NO CACHING ACROSS PROCESSES. `build_features()` is called by six separate
+#    scripts (report, opportunity, clone_targets, digest_html, predictions) that
+#    run as six separate processes in the same workflow job, each transferring
+#    the same rows again. A module-level cache cannot help across processes, so
+#    the cache is written to disk - the job's filesystem is shared between
+#    steps, which is exactly the lifetime that is needed.
+#
+# 21 days, not 7: the widest window any consumer reads is 7 days (`H` below),
+# but `derive_threshold()` measures growth over a 7-day horizon and needs a
+# second 7-day window before it to compute a distribution - at a 7-day window
+# it would find zero comparable pairs and always report "not enough history".
+# 21 days gives three full measurement windows and costs 92% -> 62% of the
+# current table, growing much slower than "everything".
+WINDOW_DAYS = int(os.environ.get("TRENDRADAR_WINDOW_DAYS", "21"))
+
+_CACHE = os.path.join(os.path.dirname(__file__), "..", "data", "features_cache.pkl")
+
+
+def _cache_key() -> tuple:
+    """Identity of the snapshot set: (max ts, row count).
+
+    Both change on every collection tick (a new ts appears, rows are added), so
+    the key invalidates itself. Deliberately not a TTL: a TTL long enough to
+    help would also survive a new ingest and serve stale features into a page
+    that claims to be current.
+    """
+    with Session() as s:
+        ts = s.query(func.max(Snapshot.ts)).scalar()
+        n = s.query(func.count()).select_from(Snapshot).scalar()
+    return (str(ts), int(n or 0))
 
 # Language buckets reported separately: these are where Roblox is growing.
 MAJOR_LANGS = ("en", "es", "pt", "ru", "id")
 
 
 def _snapshots_df() -> pd.DataFrame:
+    """Snapshots for the last WINDOW_DAYS, newest window only.
+
+    The cutoff is computed in Python rather than SQL so the same code works on
+    SQLite and Postgres without a dialect branch - `Snapshot.ts >= cutoff` with
+    a real datetime is portable, whereas `now() - interval '21 days'` is not.
+    """
+    cutoff = None
     with Session() as s:
-        rows = s.query(
+        newest = s.query(func.max(Snapshot.ts)).scalar()
+        if newest is not None:
+            cutoff = newest - timedelta(days=WINDOW_DAYS)
+        q = s.query(
             Snapshot.universe_id, Snapshot.ts, Snapshot.playing, Snapshot.visits,
             Snapshot.favorites, Snapshot.up_votes, Snapshot.down_votes,
             Snapshot.max_players, Snapshot.servers, Snapshot.avg_fill,
             Snapshot.chart_count, Snapshot.best_chart_rank, Snapshot.is_sponsored,
-        ).all()
+        )
+        if cutoff is not None:
+            q = q.filter(Snapshot.ts >= cutoff)
+        rows = q.all()
     df = pd.DataFrame(rows, columns=[
         "universe_id", "ts", "playing", "visits", "favorites", "up_votes",
         "down_votes", "max_players", "servers", "avg_fill", "chart_count",
@@ -76,8 +135,15 @@ def youtube_features(now: pd.Timestamp) -> pd.DataFrame:
     with Session() as s:
         m = s.query(Mention.universe_id, Mention.video_id, Mention.observed,
                     Mention.lang).all()
-        v = s.query(YtVideo.video_id, YtVideo.views, YtVideo.views_per_hour,
-                    YtVideo.published).all()
+        # Mentioned videos only - see the same change in digest_html.
+        # yt_videos is 38724 rows here and only 15773 of them are ever joined
+        # to a mention; the rest are transferred and dropped. 2.36 MB -> 0.96 MB
+        # per call on Neon (measured 2026-10-29).
+        v = s.execute(text("""
+            select v.video_id, v.views, v.views_per_hour, v.published
+            from yt_videos v
+            where exists (select 1 from mentions m where m.video_id = v.video_id)
+        """)).all()
 
     if not m or not v:
         return pd.DataFrame(columns=cols)
@@ -172,6 +238,42 @@ def _ratio(new, old, floor=30.0):
 
 
 def build_features() -> pd.DataFrame:
+    """Cached wrapper around _build_features().
+
+    The cache exists because six separate processes call this in one workflow
+    job and none of them can see another's memory. Keyed on (max ts, row count)
+    rather than a TTL - see _cache_key() - so a new collection tick always
+    invalidates it and a stale frame can never reach the page.
+
+    On any cache error the function simply recomputes: a corrupt or unreadable
+    pickle must not be able to break the run, and the whole point of a cache is
+    that losing it is cheap.
+    """
+    try:
+        key = _cache_key()
+    except Exception:
+        return _build_features()
+
+    try:
+        if os.path.exists(_CACHE):
+            with open(_CACHE, "rb") as fh:
+                blob = pickle.load(fh)
+            if blob.get("key") == key and isinstance(blob.get("df"), pd.DataFrame):
+                return blob["df"]
+    except Exception:
+        pass
+
+    f = _build_features()
+    try:
+        os.makedirs(os.path.dirname(_CACHE), exist_ok=True)
+        with open(_CACHE, "wb") as fh:
+            pickle.dump({"key": key, "df": f}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+    return f
+
+
+def _build_features() -> pd.DataFrame:
     snaps = _snapshots_df()
     games = _games_df()
     if snaps.empty or games.empty:

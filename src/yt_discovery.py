@@ -213,6 +213,10 @@ def run(budget: int = DEFAULT_BUDGET, dry: bool = False) -> dict:
             return stats
 
         seen_ids: set[str] = set()
+        # Column-only, not `query(YtVideo)`: the full entity pulls title,
+        # channel_id, published, views, views_per_hour, embed_checked for every
+        # row when only the id is used. Same transfer-allowance reasoning as
+        # youtube_collect (Neon at 81%, 2026-10-29): 1.33 MB vs 6.48 MB.
         matched_ids = {v for (v,) in s.query(Mention.video_id).distinct().all()}
         known_videos = {v for (v,) in s.query(YtVideo.video_id).all()}
 

@@ -82,22 +82,40 @@ def _orphan_uids(s) -> set[int]:
             s.query(Game.universe_id).filter(Game.origin == "orphan").all()}
 
 
+_PIVOT_CACHE: tuple | None = None
+
+
 def _snapshots_pivots() -> tuple[pd.DataFrame, pd.Series]:
-    """CCU by game over time, plus the market median per snapshot."""
+    """CCU by game over time, plus the market median per snapshot.
+
+    Memoised for the life of the process. This is called twice per run
+    (excess_samples(), and score()'s empty-history path) and each call
+    transfers the whole snapshots table - 40580 rows / 1.70 MB on Neon,
+    2026-10-29, against a network-transfer allowance already at 81%. The second
+    call cannot see different data: nothing writes snapshots between them
+    within a run. Per-process is safe because each entry point (record /
+    resolve / score) is its own process, so a new run starts cold.
+    """
+    global _PIVOT_CACHE
+    if _PIVOT_CACHE is not None:
+        return _PIVOT_CACHE
     with Session() as s:
         rows = s.query(Snapshot.universe_id, Snapshot.ts, Snapshot.playing).all()
         drop = _orphan_uids(s)
     df = pd.DataFrame(rows, columns=["universe_id", "ts", "playing"])
     if df.empty:
-        return pd.DataFrame(), pd.Series(dtype=float)
+        _PIVOT_CACHE = (pd.DataFrame(), pd.Series(dtype=float))
+        return _PIVOT_CACHE
     if drop:
         df = df[~df["universe_id"].isin(drop)]
         if df.empty:
-            return pd.DataFrame(), pd.Series(dtype=float)
+            _PIVOT_CACHE = (pd.DataFrame(), pd.Series(dtype=float))
+            return _PIVOT_CACHE
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     piv = (df.pivot_table(index="ts", columns="universe_id",
                           values="playing", aggfunc="last").sort_index())
-    return piv, piv.median(axis=1)
+    _PIVOT_CACHE = (piv, piv.median(axis=1))
+    return _PIVOT_CACHE
 
 
 def excess_samples(horizon_days: float = 7,
@@ -936,7 +954,8 @@ def _born_ages(s) -> dict[int, int]:
     from db import Game
     now = utcnow()
     return {g.universe_id: (now - g.created).days
-            for g in s.query(Game).filter(Game.created.isnot(None)).all()}
+            for g in s.query(Game.universe_id, Game.created)
+                     .filter(Game.created.isnot(None)).all()}
 
 
 def report() -> str:

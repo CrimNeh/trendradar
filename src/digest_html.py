@@ -29,6 +29,7 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 from db import Game, Session, Mention, Snapshot, YtVideo  # noqa: E402
+from sqlalchemy import text  # noqa: E402
 from features import build_features, flag_suspect  # noqa: E402
 import forecast  # noqa: E402
 
@@ -91,27 +92,39 @@ def _orphan_uids(s) -> set[int]:
             s.query(Game.universe_id).filter(Game.origin == "orphan").all()}
 
 
+_MARKET_CACHE: tuple | None = None
+
+
 def market_series() -> tuple[pd.DataFrame, pd.Series]:
     """Snapshot matrix plus the per-timestamp market median.
 
     The median across ~430 games is a stable proxy for the platform-wide daily
     cycle, and it is immune to one giant game moving the average.
+
+    Memoised per process. The page is built twice per deployment (once in the
+    snapshot job, once in deploy) and each call transfers the whole snapshots
+    table; within one process the data cannot change.
     """
+    global _MARKET_CACHE
+    if _MARKET_CACHE is not None:
+        return _MARKET_CACHE
     with Session() as s:
         rows = s.query(Snapshot.universe_id, Snapshot.ts, Snapshot.playing).all()
         drop = _orphan_uids(s)
     df = pd.DataFrame(rows, columns=["universe_id", "ts", "playing"])
     if df.empty:
-        return pd.DataFrame(), pd.Series(dtype=float)
+        _MARKET_CACHE = (pd.DataFrame(), pd.Series(dtype=float))
+        return _MARKET_CACHE
     if drop:
         df = df[~df["universe_id"].isin(drop)]
         if df.empty:
-            return pd.DataFrame(), pd.Series(dtype=float)
+            _MARKET_CACHE = (pd.DataFrame(), pd.Series(dtype=float))
+            return _MARKET_CACHE
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     piv = df.pivot_table(index="ts", columns="universe_id",
                          values="playing", aggfunc="last").sort_index()
-    med = piv.median(axis=1)
-    return piv, med
+    _MARKET_CACHE = (piv, piv.median(axis=1))
+    return _MARKET_CACHE
 
 
 def relative_moves(piv: pd.DataFrame, med: pd.Series) -> pd.DataFrame:
@@ -211,8 +224,22 @@ def yt_evidence() -> dict[int, dict]:
     """YouTube activity per game: how many videos, how fast they are gaining."""
     with Session() as s:
         m = s.query(Mention.universe_id, Mention.video_id, Mention.lang).all()
-        v = s.query(YtVideo.video_id, YtVideo.views, YtVideo.views_per_hour,
-                    YtVideo.title, YtVideo.published).all()
+        # Only videos that actually carry a mention. This used to load every
+        # row in yt_videos (38724 / 4.81 MB on Neon, 2026-10-29) and then merge
+        # them onto the mention table - so ~23000 rows were transferred and
+        # discarded by the `how="left"` join, whose only effect they could have
+        # had was to fill in a video_id the mention table already guarantees.
+        #
+        # Restricting to the mentioned ids is behaviourally identical (the
+        # merge is keyed on mention.video_id, so a video with no mention can
+        # never contribute a row) and halves the transfer to 2.03 MB. Scoped by
+        # a subquery rather than a materialised id list so the DB does the
+        # filtering and only matching rows cross the wire.
+        v = s.execute(text("""
+            select v.video_id, v.views, v.views_per_hour, v.title, v.published
+            from yt_videos v
+            where exists (select 1 from mentions m where m.video_id = v.video_id)
+        """)).all()
 
     if not m or not v:
         return {}

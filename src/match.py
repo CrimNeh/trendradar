@@ -191,7 +191,8 @@ if __name__ == "__main__":
     from db import Game, Session
 
     with Session() as s:
-        games = pd.DataFrame([(g.universe_id, g.name) for g in s.query(Game)],
+        games = pd.DataFrame(
+            s.query(Game.universe_id, Game.name).all(),
                              columns=["universe_id", "name"])
 
     samples = [
