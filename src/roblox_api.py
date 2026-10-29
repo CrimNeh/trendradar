@@ -47,9 +47,11 @@ class RateLimiter:
             self._next = now + self.interval
 
 
-_RATE_LIMITED = object()      # sentinel: endpoint refused us, do not retry
-
-_RATE_LIMITED = object()      # sentinel: endpoint refused us, do not retry
+# Sentinel: endpoint refused us, do not retry. Callers that pass
+# fail_fast_429=True MUST compare against this before treating the result as a
+# dict - it is a bare object(), which is truthy, so `(d or {}).get(...)` raises
+# AttributeError instead of failing safely.
+_RATE_LIMITED = object()
 
 _limiter = RateLimiter(rate=4.0)
 _session = requests.Session()

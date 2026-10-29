@@ -348,6 +348,16 @@ def _resolve_place(place_id: int) -> int | None:
     """
     d = rbx._get(f"https://apis.roblox.com/universes/v1/places/{place_id}/universe",
                 tries=2, fail_fast_429=True)
+    # The sentinel MUST be checked before `.get()`. `_get` returns a bare
+    # `object()` on 429 when fail_fast_429 is set, and that object is TRUTHY -
+    # so `(d or {})` passes it straight through and `.get` raises
+    # AttributeError. Caught in the audit of 2026-10-29, one day after I added
+    # fail_fast_429 here: any 429 on this endpoint would have crashed the whole
+    # poll, and because the commit for the channel loop happens AFTER this
+    # block, that crash silently discarded every video row and every mention
+    # collected in the run. Trading a timeout for data loss is not a fix.
+    if d is rbx._RATE_LIMITED:
+        return None
     uid = (d or {}).get("universeId")
     return int(uid) if uid else None
 
@@ -615,9 +625,23 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
                 if matcher.suspicious_title(u["title"]):
                     continue
                 pending.append((u, lang))
-            # No commit here. Committing per channel cost ~180 ms each (92
-            # round trips = 17 s) and bought nothing: every row is keyed, so a
-            # partial run is simply re-run. One commit at the end.
+            # No commit per channel: it cost ~180 ms each (92 round trips =
+            # 17 s) and bought nothing, since every row is keyed and a partial
+            # run is simply re-run.
+
+        # One commit for the whole channel loop, BEFORE anything that can
+        # fail in a new way. Previously the first commit after this loop sat
+        # inside the `unknown_places` block below, i.e. after a network call
+        # to Roblox. Any exception there - a 429 mishandled, a DNS blip, a
+        # timeout - discarded the entire run's work: every new yt_videos row
+        # and every mention, silently, because SQLAlchemy rolls back an
+        # uncommitted session on exit. Found in the 2026-10-29 audit; the
+        # 429 bug that exposed it would have been a mere failed run instead of
+        # a lost day of data had this commit existed.
+        #
+        # The work is keyed and idempotent, so committing early costs nothing
+        # when a later step fails - it just means the next run redoes less.
+        s.commit()
 
         # ---- games never seen in charts, discovered through video links
         if unknown_places:
