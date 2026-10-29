@@ -330,7 +330,24 @@ def _already_matched(s, video_id: str) -> bool:
 
 
 def _resolve_place(place_id: int) -> int | None:
-    d = rbx._get(f"https://apis.roblox.com/universes/v1/places/{place_id}/universe")
+    """Resolve a place id found in a video link to its universe id.
+
+    `fail_fast_429` is not optional here. Run #85 (2026-10-29) timed out at 12
+    minutes with `youtube_full: not due yet` - i.e. the semantic pass never
+    ran at all, so the only network calls left that could burn that much time
+    are the per-channel RSS fetches (already parallel, ~5s total) and THIS
+    call, made once per unresolved place link, up to MAX_NEW_GAMES_PER_RUN=25
+    times a run.
+    
+    Without fail_fast_429, a single 429 here retries 4 times with backoff up
+    to 30s each - up to 2 minutes PER CALL, 25 calls = up to 50 minutes. That
+    comfortably exceeds the 12-minute step timeout on its own, with nothing
+    else in this code path doing real work. `get_details()` already uses this
+    flag for exactly the same endpoint family; this call was the one place it
+    was missed.
+    """
+    d = rbx._get(f"https://apis.roblox.com/universes/v1/places/{place_id}/universe",
+                tries=2, fail_fast_429=True)
     uid = (d or {}).get("universeId")
     return int(uid) if uid else None
 
