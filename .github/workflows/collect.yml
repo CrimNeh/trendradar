@@ -46,13 +46,15 @@ env:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    # 20 was set when a normal run finished in ~11 min. Since the due-gate made
-    # origins, YouTube discovery and the full embedding pass all land on the
-    # same tick, the heavy runs now take ~20.4 min - three of them were killed
-    # at exactly 20.0 min, on the `Collect YouTube` step, skipping everything
-    # after it (report, digest, record, resolve). 35 leaves room for the 120 MB
-    # embedding model on a cold cache without letting a hung run burn an hour.
-    timeout-minutes: 35
+    # 15, not 35. With YouTube moved to its own job this one only collects
+    # Roblox snapshots (~2 min) and derives the reports and the digest from
+    # them (~3-5 min). The old 35 existed to absorb the 120 MB embedding model
+    # and a slow RSS sweep, neither of which is here any more.
+    #
+    # The real point is that this job is now on the critical path ALONE: if it
+    # dies, nothing publishes. So its ceiling is set just above measured cost
+    # instead of generously above a worst case that no longer lives here.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
@@ -83,14 +85,6 @@ jobs:
           print("database reachable")
           PY
 
-      # The embedding model (~120 MB) is cached so it downloads once, not on
-      # every run. This cache holds a model, not data, so eviction is harmless.
-      - name: Cache embedding model
-        uses: actions/cache@v5
-        with:
-          path: data/models
-          key: emb-model-v1
-
       # The semantic index (data/emb_cache.npz: one vector per game + the
       # hubness pool) is NOT in git - it is derived data, and `data/` is
       # gitignored for exactly that reason. But it was also missing from
@@ -119,61 +113,6 @@ jobs:
 
       - name: Collect Roblox
         run: python src/collect.py
-
-      # Link + token matching run every tick; the semantic pass loads a 120 MB
-      # model and embeds every unmatched title, so it runs on a minority of
-      # ticks. With 8 runs/day, hours divisible by 3 give exactly 2 full passes
-      # (00:00 and 12:00 UTC) and 6 cheap ones.
-      # Capped at 12 minutes and allowed to fail without killing the run.
-      #
-      # Run #83 was cancelled at the job's 35-minute ceiling with this step at
-      # 32.4 minutes - and because a timeout cancels the whole job, every step
-      # after it was skipped: no digest, no forecast record, no resolve. A slow
-      # YouTube poll silently cost a full day of forecasts. The work itself is
-      # resumable (unmatched titles stay queued, `due.py` only marks the pass
-      # complete on success), so giving this step time to finish is worth less
-      # than guaranteeing the steps below always run.
-      #
-      # continue-on-error means a timeout or a transient YouTube failure leaves
-      # `youtube_full` unmarked, so the next tick retries it.
-      - name: Collect YouTube
-        continue-on-error: true
-        timeout-minutes: 12
-        run: |
-          if python src/due.py youtube_full 11; then
-            python src/youtube_collect.py && python src/due.py mark youtube_full
-          else
-            python src/youtube_collect.py --no-embed
-          fi
-
-      # API discovery: searches YouTube BY GAME NAME for the games that moved
-      # most, instead of waiting for a tracked channel to mention one. Costs
-      # real quota (1,100 units/run), so twice a day with a hard budget.
-      # Without YT_API_KEY it exits immediately and RSS carries on.
-      - name: YouTube discovery (API)
-        continue-on-error: true
-        timeout-minutes: 10
-        run: |
-          if python src/due.py yt_discovery 11; then
-            python src/yt_discovery.py --budget 1200 && python src/due.py mark yt_discovery
-          fi
-
-      # Weekly channel audit: deactivates feeds that produce no Roblox signal.
-      # Run on Monday 00:00 so it does not race the discovery pass.
-      - name: Audit channels (weekly)
-        run: |
-          if python src/due.py audit 160; then
-            python src/channel_quality.py --apply && python src/due.py mark audit
-          fi
-
-      # External sources change slowly (Steam charts, anime calendar, devforum).
-      # Steam alone is ~40 throttled requests, so twice a day is both sufficient
-      # and safe from rate limits.
-      - name: Collect origins (every ~11h)
-        run: |
-          if python src/due.py origins 11; then
-            python src/origins.py && python src/due.py mark origins
-          fi
 
       - name: Report
         run: python src/report.py
@@ -215,10 +154,111 @@ jobs:
           path: reports/
           retention-days: 7
 
+  # YouTube collection lives in its OWN job, not inside `snapshot`.
+  #
+  # Why: run #105 (2026-10-31) died at the job-level 35-minute ceiling with
+  # `Collect YouTube` and `YouTube discovery` both timing out. Because a job
+  # timeout cancels the job, every step after them was skipped - report,
+  # opportunities, clone targets, the digest, the forecast record AND the
+  # resolve. `continue-on-error: true` on those steps was already set and could
+  # not help: it protects against a STEP failing, not against the clock running
+  # out on the JOB.
+  #
+  # The two halves have nothing to do with each other. Roblox snapshots take
+  # ~2 minutes and produce everything the site shows; YouTube enrichment is
+  # slow, resumable and entirely optional. Putting the optional half on the
+  # critical path meant a slow RSS poll could cost a day of forecasts, which
+  # is exactly what happened twice.
+  #
+  # Now the worst case for YouTube is that this job fails alone. Steps are
+  # already due-gated and resumable, so the next tick picks the work back up.
+  youtube:
+    runs-on: ubuntu-latest
+    # Own ceiling, sized for the semantic pass on a cold model cache. Nothing
+    # downstream depends on this job, so a generous bound costs nothing.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -q -r requirements.txt
+
+      - name: Cache embedding model
+        uses: actions/cache@v5
+        with:
+          path: data/models
+          key: emb-model-v1
+
+      - name: Cache semantic index
+        uses: actions/cache@v5
+        with:
+          path: data/emb_cache.npz
+          key: emb-index-${{ github.run_id }}
+          restore-keys: |
+            emb-index-
+
+      - name: Create schema
+        run: python src/db.py
+
+      # Link + token matching run every tick; the semantic pass loads a 120 MB
+      # model and embeds every unmatched title, so it runs on a minority of
+      # ticks. With 8 runs/day, hours divisible by 3 give exactly 2 full passes
+      # (00:00 and 12:00 UTC) and 6 cheap ones.
+      - name: Collect YouTube
+        continue-on-error: true
+        timeout-minutes: 14
+        run: |
+          if python src/due.py youtube_full 11; then
+            python src/youtube_collect.py && python src/due.py mark youtube_full
+          else
+            python src/youtube_collect.py --no-embed
+          fi
+
+      # API discovery: searches YouTube BY GAME NAME for the games that moved
+      # most, instead of waiting for a tracked channel to mention one. Costs
+      # real quota (1,100 units/run), so twice a day with a hard budget.
+      # Without YT_API_KEY it exits immediately and RSS carries on.
+      - name: YouTube discovery (API)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          if python src/due.py yt_discovery 11; then
+            python src/yt_discovery.py --budget 1200 && python src/due.py mark yt_discovery
+          fi
+
+      # Weekly channel audit: deactivates feeds that produce no Roblox signal.
+      # Run on Monday 00:00 so it does not race the discovery pass.
+      - name: Audit channels (weekly)
+        continue-on-error: true
+        run: |
+          if python src/due.py audit 160; then
+            python src/channel_quality.py --apply && python src/due.py mark audit
+          fi
+
+      # External sources change slowly (Steam charts, anime calendar, devforum).
+      # Steam alone is ~40 throttled requests, so twice a day is both sufficient
+      # and safe from rate limits.
+      - name: Collect origins (every ~11h)
+        continue-on-error: true
+        run: |
+          if python src/due.py origins 11; then
+            python src/origins.py && python src/due.py mark origins
+          fi
+
   # Separate job because Pages deployment needs its own permissions and an
   # environment.
   deploy:
     needs: snapshot
+    # Publish even when the snapshot job failed. The digest is rebuilt from the
+    # database inside this job, so a failed Roblox collection means the page
+    # shows the last good data - which is strictly better than the site not
+    # updating at all. Before this, one flaky collect.py call blanked the site
+    # until someone noticed.
+    if: always() && needs.snapshot.result != 'cancelled'
     runs-on: ubuntu-latest
     permissions:
       pages: write
@@ -238,8 +278,14 @@ jobs:
       # captured as an artifact. Without this download the copy step below found
       # an empty reports/ directory, its `|| true` swallowed the failure, and
       # docs/opportunity.md was never published - silently, on every run.
+      # `continue-on-error` because this artifact does not exist when the
+      # snapshot job failed - and that is exactly the case deploy now runs in
+      # on purpose (see `if:` above). Without it the missing artifact aborted
+      # the job before the digest was built, so allowing a failed snapshot to
+      # reach deploy would have published nothing anyway.
       - name: Fetch reports from the snapshot job
         uses: actions/download-artifact@v5
+        continue-on-error: true
         with:
           name: reports-${{ github.run_id }}
           path: reports/

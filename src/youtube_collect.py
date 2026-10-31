@@ -144,6 +144,64 @@ TIER_HOT_DAYS = 7
 TIER_WARM_DAYS = 30
 COLD_EVERY = 8
 
+# Hard ceiling on how many channels one run may poll.
+#
+# Tiering alone did not bound the work: it decides WHICH channels a run visits,
+# not how many. Measured 2026-10-31 - 2 817 channels in the table, 2 211 of
+# them "hot" (a mention in the last 7 days), so 97% of the signal came from a
+# set that tiering sent to EVERY run. Video intake went from 2 241/day on 10-25
+# to 19 093/day on 10-31, and runs started dying at the 12-minute step timeout;
+# run #105 lost the digest, the forecast record and the resolve.
+#
+# That growth was a feedback loop: discovery adds a channel, the next run polls
+# it, its RSS archive lands in yt_videos, the table grows faster than the run
+# budget. Nothing capped the loop, so nothing stopped it.
+#
+# 150 comes from measurement, not taste. Ranked by historical matched videos
+# against the live table:
+#
+#   top-100 -> 1 953 videos/day, 22% of all signal
+#   top-150 -> ~2 600 videos/day, ~27%
+#   top-400 -> 6 153 videos/day, 49%
+#
+# 150 keeps a run inside its time budget with room for the semantic pass.
+MAX_CHANNELS_PER_RUN = int(os.environ.get("YT_MAX_CHANNELS", "150"))
+
+# Look-back used to rank channels. Two weeks: long enough that a real Roblox
+# channel is never ranked on one quiet week, short enough that a channel which
+# pivoted away from Roblox drops out within a fortnight.
+CHANNEL_RANK_DAYS = int(os.environ.get("YT_CHANNEL_RANK_DAYS", "14"))
+
+# Prefilter: only videos with a plausible link to a tracked game get stored.
+#
+# Measured 2026-10-31 over one day of intake (19 093 videos): 43.5% had a
+# tracked game's name in the title. The other 56.5% looked like this, verbatim:
+#
+#   "DENIS has a creepy neighbor for real"
+#   "Bacon tried to poison her food #shorts"
+#   "A BEBE PERCEBEU QUE O NAMORADO SUMIU NA FUGA DE TECLADOS DE DOCES! Roblox"
+#
+# Roblox-adjacent lifestyle shorts from large channels. Each costs a row, a
+# transfer byte and a semantic pass, and the measured hit rate on them is near
+# zero - which is why the table sits at 59% rows with no mention.
+#
+# Two ways in, either is enough:
+#   * a tracked game's name appears in the title (matcher.best_match)
+#   * the description carries ANY roblox.com/games/ link
+#
+# The second clause deliberately accepts links to games we do NOT track yet:
+# those are how discovery finds new games (see `unknown_places`), so requiring a
+# tracked game would close the only route by which a game enters the catalogue.
+#
+# Cost, measured on the same data by match method: signal found via title token
+# or description link passes through; signal found ONLY by the semantic pass
+# (embed/search, 10.6% of matches) is lost, because a video that names nothing
+# and links nothing cannot be recognised before the expensive pass runs. That
+# 10.6% is the price of a 56% cut and it is recoverable - the same videos return
+# through `yt_discovery`, which searches BY GAME NAME and so never produces an
+# unmatchable title.
+PREFILTER = os.environ.get("YT_PREFILTER", "1") != "0"
+
 # A channel with no uploads on its feed is dead weight. After this many
 # consecutive empty polls it is deactivated instead of retried forever.
 MAX_EMPTY_POLLS = int(os.environ.get("YT_MAX_EMPTY", "5"))
@@ -429,15 +487,35 @@ def _ingest_new_games(s, universe_ids: list[int]) -> int:
 # ------------------------------------------------------------------ poll
 
 def _select_channels(s, now, run_no: int) -> list:
-    """Which channels to poll this run, by tier.
+    """Which channels to poll this run - highest-producing first, hard-capped.
 
-    The naive version polled every active channel every time. That looked fine
-    until the database showed 70 of 177 with last_checked NULL - the run was
-    being cut short and the same early channels were polled forever while the
-    rest never got a turn.
+    History matters. The oldest version polled every active channel every run
+    and left 70 of 177 never checked, because the run died first and the same
+    early channels were always the ones reached. Tiering fixed the ordering but
+    not the size: with 2 817 channels and 2 211 "hot", tiering still sent the
+    vast majority to every run, and intake grew from 2 241 to 19 093 videos/day
+    in six days.
 
-    Tiering fixes both problems: hot channels are always fresh, cold ones are
-    still covered but one eighth as often, and the whole set is reachable.
+    So this is a RANKING with a ceiling, not a filter:
+
+      * rank every active channel by how many distinct matched videos it
+        produced in the last CHANNEL_RANK_DAYS - the only thing measured to
+        correlate with producing more
+      * never-polled channels (last_checked IS NULL) sort first, so a newly
+        discovered channel gets one fair trial before it has any history to be
+        ranked by. Without this a new channel could never earn a rank and the
+        set would freeze around whoever existed on day one.
+      * cut at MAX_CHANNELS_PER_RUN
+
+    The ranking is recomputed from `mentions` every run, so it is a sliding
+    window rather than a frozen list: a channel that goes quiet loses its slot
+    to one that is producing. That self-correction is what makes a ceiling this
+    low safe - the set cannot ossify around stale winners.
+
+    Tiering is gone deliberately. With a ceiling in place it did nothing except
+    reorder a list that gets truncated anyway, and the two mechanisms could
+    disagree: a "hot" channel past the cutoff was dropped while a cold one
+    inside the rotation was kept.
     """
     from datetime import timedelta
 
@@ -445,36 +523,46 @@ def _select_channels(s, now, run_no: int) -> list:
     if not channels:
         return []
 
-    # Last mention per channel tells us who is actually producing.
-    last_hit: dict[str, object] = {}
-    rows = s.execute(text(
-        "select channel_id, max(observed) from mentions "
-        "where channel_id is not null group by channel_id")).fetchall()
-    for cid, ts in rows:
-        last_hit[cid] = ts
+    # Distinct matched videos per channel over the window. DISTINCT because one
+    # video can mention several games, and a channel firing five mentions on one
+    # video has not produced five times the evidence.
+    cut = now - timedelta(days=CHANNEL_RANK_DAYS)
+    hits: dict[str, int] = {}
+    for cid, n in s.execute(text("""
+        select channel_id, count(distinct video_id) n
+        from mentions
+        where channel_id is not null and observed >= :cut
+        group by channel_id
+    """), {"cut": cut}).fetchall():
+        hits[cid] = int(n)
 
-    hot_cut = now - timedelta(days=TIER_HOT_DAYS)
-    warm_cut = now - timedelta(days=TIER_WARM_DAYS)
+    by_id = {c.channel_id: c for c in channels}
 
-    out = []
-    cold = []
-    for ch in channels:
-        hit = last_hit.get(ch.channel_id)
-        if hit is not None and hit >= hot_cut:
-            out.append(ch)                      # hot: every run
-        elif hit is not None and hit >= warm_cut:
-            if run_no % 2 == 0:                 # warm: every other run
-                out.append(ch)
-            else:
-                cold.append(ch)
-        else:
-            cold.append(ch)
+    # Ranked producers first, best first. Ties broken by channel_id so the
+    # selection is deterministic - otherwise an equal score could produce a
+    # different set each tick and channels would starve at random.
+    out: list = []
+    chosen: set[str] = set()
+    for cid, _n in sorted(hits.items(), key=lambda kv: (-kv[1], kv[0])):
+        ch = by_id.get(cid)
+        if ch is None or cid in chosen:
+            continue
+        out.append(ch)
+        chosen.add(cid)
+        if len(out) >= MAX_CHANNELS_PER_RUN:
+            return out
 
-    # Cold slice: deterministic rotation by run number.
-    if cold:
-        slot = run_no % COLD_EVERY
-        step = max(1, len(cold) // COLD_EVERY)
-        out.extend(cold[slot * step:(slot + 1) * step] or cold[:step])
+    # Then channels with no history in the window - never-polled first. These
+    # are new discoveries awaiting their trial or channels that went quiet;
+    # both are worth a slot only while there is room.
+    rest = [c for c in channels if c.channel_id not in chosen]
+    rest.sort(key=lambda c: (c.last_checked is not None,
+                             c.last_checked or 0,
+                             c.channel_id))
+    for ch in rest:
+        out.append(ch)
+        if len(out) >= MAX_CHANNELS_PER_RUN:
+            break
 
     return out
 
@@ -606,6 +694,21 @@ def poll_channels(discover: bool = False, langs: list[str] | None = None,
 
             for u in uploads:
                 u["channel_id"] = ch.channel_id
+
+                # Prefilter BEFORE the insert, not after. See PREFILTER above:
+                # a video that names no tracked game and links to no Roblox
+                # place is not evidence of anything, and storing it only to
+                # discover that later costs a row, a transfer byte and a
+                # semantic pass on every subsequent run.
+                #
+                # Known videos skip the test: they are already in the table and
+                # this loop still has to refresh their view count.
+                if (PREFILTER and u["video_id"] not in known_videos
+                        and not matcher.best_match(u["title"], match_frame)
+                        and not matcher.extract_place_ids(u.get("description"))):
+                    stats["prefiltered"] = stats.get("prefiltered", 0) + 1
+                    continue
+
                 if _record_video(s, u, now, known_videos, video_rows):
                     stats["videos"] += 1
                 if u["video_id"] in matched_videos:
