@@ -259,6 +259,10 @@ jobs:
     # updating at all. Before this, one flaky collect.py call blanked the site
     # until someone noticed.
     if: always() && needs.snapshot.result != 'cancelled'
+    # This job had no ceiling at all while `snapshot` has 15. A hung
+    # `digest_html.py` would have held the Pages environment indefinitely and
+    # blocked every later deploy behind it in the same concurrency group.
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
       pages: write
@@ -297,6 +301,34 @@ jobs:
         run: python src/digest_html.py
         env:
           TRENDRADAR_DB: ${{ secrets.TRENDRADAR_DB }}
+
+      # `docs/` is gitignored, so it does NOT exist after checkout - it is
+      # created by digest_html.py itself. That means a failure inside that
+      # script leaves no directory at all, and `upload-pages-artifact` with
+      # `path: docs` fails with a message about a missing path rather than
+      # about the actual cause. Worse, when the step is skipped for any
+      # reason the artifact upload would publish an EMPTY site over a good
+      # one.
+      #
+      # So assert the product, not the exit code: a digest with no file, or a
+      # file of implausible size, is not something to put on the internet.
+      - name: Verify the digest was produced
+        id: verify
+        run: |
+          f=docs/index.html
+          if [ ! -f "$f" ]; then
+            echo "::error::$f was not created - digest_html.py did not complete"
+            exit 1
+          fi
+          size=$(wc -c < "$f")
+          echo "digest size: $size bytes"
+          # Measured: a real page is ~40-90 KB. Under 5 KB means the template
+          # rendered with no rows, which would look like an empty market.
+          if [ "$size" -lt 5000 ]; then
+            echo "::error::$f is only $size bytes - refusing to publish an empty digest"
+            exit 1
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
 
       - name: Add markdown copy
         run: |

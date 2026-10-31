@@ -125,6 +125,19 @@ class Snapshot(Base):
 
 
 class ChannelHit(Base):
+    """Per-carousel rank of a game at one snapshot tick.
+
+    NOT WRITTEN ANY MORE. The table grew to 71 517 rows at ~3 200/day and had
+    zero readers: `features.py` derives everything it needs from
+    `snapshots.chart_count` and `snapshots.best_chart_rank`, which are written
+    in the same loop and carry the same information in aggregate. Nothing in
+    src/, dashboard/, queries.sql or the workflow ever selected from this table.
+
+    The class is kept so `init_db()` does not drop the existing rows on the
+    next schema pass - historical data stays queryable if the per-carousel
+    detail is ever wanted. Re-enable writing by restoring the loop in
+    collect.py.
+    """
     __tablename__ = "channel_hits"
 
     id = Column(PKType, primary_key=True, autoincrement=True)

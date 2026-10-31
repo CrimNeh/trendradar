@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import roblox_api as api
 from classify import classify
-from db import ChannelHit, Game, Session, Snapshot, init_db, utcnow
+from db import Game, Session, Snapshot, init_db, utcnow
 
 # Server stats are optional enrichment and the endpoint rate limits hard
 # (returns 429 for a whole day at a time). Off by default; enable with
@@ -139,8 +139,6 @@ def collect(do_servers: bool = True) -> dict:
                 best_chart_rank=min((r for _, r in hits), default=None),
                 is_sponsored=1 if uid in sponsored else 0,
             ))
-            for sort_id, rank in hits:
-                s.add(ChannelHit(universe_id=uid, ts=ts, sort_id=sort_id, rank=rank))
             written += 1
         s.commit()
 
