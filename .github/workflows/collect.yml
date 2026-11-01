@@ -144,6 +144,45 @@ jobs:
       - name: Resolve due forecasts
         run: python src/predictions.py resolve
 
+      # Hand the feature frame to `deploy` instead of letting it pay for the
+      # same query again.
+      #
+      # Measured 2026-11-01 through Neon's own transfer counter: the project
+      # spent 113 MB in 9 hours = 8.8 GB/month against a 5 GB limit. Half of
+      # that was this frame being built twice per tick - once here, once in
+      # `deploy`, which runs on a different machine and cannot see this one's
+      # disk. The file is ~0.5 MB against ~6 MB of reads, so shipping it costs
+      # almost nothing and saves the larger half.
+      #
+      # `if: always()` because the frame is useful even when a later step
+      # failed; deploy has its own fallback (recompute) if it is absent.
+      - name: Upload feature cache
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: features-cache-${{ github.run_id }}
+          path: data/features_cache.pkl
+          retention-days: 1
+
+      # Ship the finished page, not the ingredients.
+      #
+      # `deploy` used to rebuild the digest from the database on a machine that
+      # cannot share this one's disk - a full second read of the same 5.3 MB
+      # window, eight times a day. Handing over the 55 kB HTML removes that
+      # read entirely, which is a better trade than handing over the feature
+      # frame and hoping deploy finds it: the page is what actually gets
+      # published.
+      #
+      # Measured context, 2026-11-01: 113 MB of transfer in 9 hours, i.e.
+      # 8.8 GB/month against a 5 GB free tier. Reads are the whole bill.
+      - name: Upload digest
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: digest-${{ github.run_id }}
+          path: docs/
+          retention-days: 1
+
       # Keep the markdown/CSV reports for 7 days. The database itself lives in
       # Neon, so there is nothing to upload for it.
       - name: Keep reports (7 days)
@@ -297,7 +336,36 @@ jobs:
       # Rebuild the page from the live database. The snapshot job's copy is not
       # shared between jobs, and the page must reflect the same data the
       # forecasts were recorded against.
-      - name: Build HTML digest
+      # Restore the frame the snapshot job already built. `continue-on-error`
+      # because its absence is not a failure: digest_html.py recomputes from
+      # the database, it just costs a second read of the same rows.
+      - name: Fetch feature cache from the snapshot job
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: features-cache-${{ github.run_id }}
+          path: data/
+
+      # Take the page the snapshot job already built. This is the fast path:
+      # no database access at all, so a routine tick costs deploy zero transfer.
+      - name: Fetch digest from the snapshot job
+        id: fetch_digest
+        uses: actions/download-artifact@v5
+        continue-on-error: true
+        with:
+          name: digest-${{ github.run_id }}
+          path: docs/
+
+      # Only when that artifact is absent - i.e. the snapshot job failed badly
+      # enough that even `if: always()` produced nothing. Then rebuild from the
+      # database, which is what this job always used to do.
+      #
+      # The condition is on the artifact, not on `needs.snapshot.result`: the
+      # snapshot job can fail AFTER writing the digest (a later step breaking),
+      # in which case the HTML on the artifact is perfectly good and rebuilding
+      # would be a wasted read.
+      - name: Build HTML digest (fallback)
+        if: steps.fetch_digest.outcome == 'failure'
         run: python src/digest_html.py
         env:
           TRENDRADAR_DB: ${{ secrets.TRENDRADAR_DB }}

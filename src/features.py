@@ -56,17 +56,43 @@ _CACHE = os.path.join(os.path.dirname(__file__), "..", "data", "features_cache.p
 
 
 def _cache_key() -> tuple:
-    """Identity of the snapshot set: (max ts, row count).
+    """Identity of the snapshot set: (max ts, max id, row count at that ts).
 
-    Both change on every collection tick (a new ts appears, rows are added), so
-    the key invalidates itself. Deliberately not a TTL: a TTL long enough to
-    help would also survive a new ingest and serve stale features into a page
-    that claims to be current.
+    All three change on every collection tick, so the key invalidates itself.
+    Deliberately not a TTL: a TTL long enough to help would also survive a new
+    ingest and serve stale features into a page that claims to be current.
+
+    THE ROW COUNT IS SCOPED, AND THAT IS A TRANSFER FIX, NOT A TIDINESS ONE.
+
+    This used to be `count(*)` over the whole snapshots table, run on every
+    process in every tick - 7 processes x 8 ticks = 56 times a day. Measured
+    through Neon's own counter on 2026-11-01: the project spent 113 MB of
+    transfer in 9 hours, which extrapolates to 8.8 GB/month against a 5 GB free
+    tier limit. A single `count(*)` walks an Index Only Scan of the entire
+    table - 1 408 kB at 50 616 rows - so this one line was 77 MB/day, a quarter
+    of all traffic through the database.
+
+    Worse, it grew WITH the table rather than with the window: 159 MB/day at
+    100k rows, 314 at 200k, 624 at 400k. The thing the cache exists to make
+    cheap was quietly becoming the most expensive query in the system.
+
+    `count(*)` at max(ts) answers the same question for cache validity - "has a
+    new tick landed, and did it bring rows" - at 128 kB instead of 1 408 kB,
+    because it touches three rows' worth of the ts index instead of all of it.
+    Combined with max(id), which is a backward primary-key scan of 56 kB, the
+    key still changes on every insert and every new tick.
+
+    Three queries rather than one because they invert: max(ts) and max(id) are
+    two tiny scans, while the count is a range. Keeping the count scoped is
+    what removes the linear growth; keeping it at all is what keeps the key
+    honest for a tick that re-writes the same ts.
     """
     with Session() as s:
         ts = s.query(func.max(Snapshot.ts)).scalar()
-        n = s.query(func.count()).select_from(Snapshot).scalar()
-    return (str(ts), int(n or 0))
+        last_id = s.query(func.max(Snapshot.id)).scalar()
+        n = ((s.query(func.count(Snapshot.id))
+                .filter(Snapshot.ts == ts).scalar()) if ts is not None else 0)
+    return (str(ts), int(last_id or 0), int(n or 0))
 
 # Language buckets reported separately: these are where Roblox is growing.
 MAJOR_LANGS = ("en", "es", "pt", "ru", "id")

@@ -121,7 +121,30 @@ class Snapshot(Base):
     best_chart_rank = Column(Integer)
     is_sponsored = Column(Integer, default=0)
 
-    __table_args__ = (Index("ix_snap_game_ts", "universe_id", "ts"),)
+    # COVERING index for the one query every report runs.
+    #
+    # `_snapshots_df()` selects exactly the thirteen columns below for the last
+    # 21 days, and it ran as a Seq Scan: 675 blocks / 5.4 MB per call, sixteen
+    # calls a day. Including the columns makes it an Index Only Scan - the heap
+    # is never touched - and, more importantly, makes the cost proportional to
+    # the WINDOW rather than to the table. A Seq Scan grows with total rows
+    # forever; this does not.
+    #
+    # Measured on Neon 2026-11-01, which is why this matters: the project was
+    # spending 8.8 GB/month of transfer against a 5 GB free-tier limit, and
+    # this query was the single largest line item.
+    #
+    # Order: ts first, because that is the only predicate. universe_id is not a
+    # filter here, it is payload.
+    __table_args__ = (
+        Index("ix_snap_game_ts", "universe_id", "ts"),
+        Index(
+            "ix_snap_cover_window",
+            "ts", "universe_id", "playing", "visits", "favorites",
+            "up_votes", "down_votes", "max_players", "servers", "avg_fill",
+            "chart_count", "best_chart_rank", "is_sponsored",
+        ),
+    )
 
 
 class ChannelHit(Base):
@@ -371,6 +394,29 @@ def _migrate() -> None:
                 "ALTER TABLE games ALTER COLUMN origin SET DEFAULT 'carousel'"))
         if insp.has_table("predictions") and is_pg:
             _install_settled_guard(con)
+
+        # Covering index for the 21-day snapshot window.
+        #
+        # Created here explicitly because create_all() only builds indexes for
+        # tables it creates - it never adds one to a table that already exists,
+        # and `snapshots` has existed since the first release. Without this the
+        # Index() declared on the model would be silently absent in production
+        # and the query would keep running as a Seq Scan: 675 blocks / 5.4 MB
+        # per call, sixteen calls a day.
+        #
+        # CONCURRENTLY is not usable inside the migration's transaction, so this
+        # is a plain build. At ~50k rows it takes well under a second; on a much
+        # larger table it would briefly hold a lock, which is acceptable here
+        # because the whole migration already runs before any collection.
+        if insp.has_table("snapshots"):
+            con.execute(text("""
+                CREATE INDEX IF NOT EXISTS ix_snap_cover_window
+                ON snapshots (
+                    ts, universe_id, playing, visits, favorites, up_votes,
+                    down_votes, max_players, servers, avg_fill, chart_count,
+                    best_chart_rank, is_sponsored
+                )
+            """))
 
 
 def _install_settled_guard(con) -> None:
