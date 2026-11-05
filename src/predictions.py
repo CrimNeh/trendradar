@@ -237,7 +237,20 @@ def derive_threshold(percentile: int = 75, horizon_days: float = 7,
 #       the exact mix of fixes present differs slightly within version 2 itself
 #       (e.g. the benchmark fix landed 2026-10-28), which is a known gap - see
 #       CHANGELOG below rather than assume every v2 row is judged identically.
-CURRENT_RULESET_VERSION = 2
+#   3 = 2026-11-05 onward. Three changes at once, which is why the version
+#       moved: `move` horizon 7 -> 3 days, the pp bar taken from
+#       derive_threshold() instead of a hardcoded 20, and deduplication made
+#       time-aware so an open row stops blocking the same game forever.
+#
+#       The previous version's verdict is on the record and was NOT good:
+#       v2 scored 10 hit / 34 miss / 4 partial = 20.8% against a 26.5% base
+#       rate (48 graded rows, p=0.42). That result is suspect rather than
+#       conclusive, because `digest_selection()` inherited a broken
+#       relative_moves() that required a game to exist on the first row of the
+#       fit window - so v2 graded a pool of 244 games instead of 766 and fitted
+#       `trend` across 16 days instead of 7. Both are fixed as of this version.
+#       Treat v2 numbers as "measured under a defect", not as "proven wrong".
+CURRENT_RULESET_VERSION = 3
 
 # How each kind of forecast is judged. Deliberately blunt: a percentage move.
 # Anything softer ("became popular") cannot be scored, and a soft criterion is
@@ -251,7 +264,19 @@ PLANS = {
     # over a week. So an absolute +20% bar is almost exactly "did the market
     # grow", and every forecast would pass or fail together regardless of the
     # game. The criterion has to be relative to beat that.
-    "move":  {"metric": "ccu", "criterion": "beat_market_20pct", "horizon": 7},
+    # Horizon 3 days, not 7. Two measured reasons.
+    #
+    # THROUGHPUT. A 7-day claim holds its game hostage for a week, and
+    # `_already_open` refuses a second forecast for a game already under one.
+    # Measured 2026-10-28..11-04: 1 new row per day against a ceiling of 8,
+    # because 17 open rows were each occupying a game. The sample stopped
+    # growing at exactly the moment it needed to grow.
+    #
+    # SIGNAL DECAY. Spread over a week, a launch spike and its reversion cancel
+    # out; the same game at 3 days still carries the move that made it surface.
+    # This also matches how the page reads the market (MARKET_WINDOW_DAYS = 7
+    # of history, but a 3-day forward claim).
+    "move":  {"metric": "ccu", "criterion": "beat_market_20pct", "horizon": 3},
     # A clone target gets longer: a copy needs time to show whether the
     # original held.
     "clone": {"metric": "ccu", "criterion": "up_20pct", "horizon": 14},
@@ -268,6 +293,35 @@ STALE_HOURS = 48
 
 
 
+_THRESHOLD_CACHE: dict[int, float] = {}
+
+
+def _threshold_for(plan: dict) -> float:
+    """The pp bar for this plan, measured from history.
+
+    Percentile fixed at 75 deliberately: it states a known prior ("this beat
+    3 of 4 comparable games") instead of an arbitrary magnitude. Recomputed
+    once per process per horizon - `excess_samples()` walks the whole snapshot
+    matrix, so calling it per candidate would be 8x the work for the same
+    number.
+
+    On insufficient history it returns the plan's fallback rather than raising:
+    a forecast with a slightly wrong bar is better than no forecast, and the
+    version stamp on the row records which rules produced it.
+    """
+    horizon = int(plan.get("horizon", 7))
+    if horizon in _THRESHOLD_CACHE:
+        return _THRESHOLD_CACHE[horizon]
+    try:
+        d = derive_threshold(75, horizon)
+        val = float(d["threshold_pp"]) if d.get("ok") else float(
+            plan.get("threshold_pp", 20.0))
+    except Exception:
+        val = float(plan.get("threshold_pp", 20.0))
+    _THRESHOLD_CACHE[horizon] = val
+    return val
+
+
 def _already_open(s, kind: str, universe_id: int | None, subject: str) -> bool:
     """One open forecast per game per kind.
 
@@ -281,9 +335,25 @@ def _already_open(s, kind: str, universe_id: int | None, subject: str) -> bool:
     The name is only used as a fallback for rows that have no universe_id, which
     should not exist for `move` but does for aggregate kinds.
     """
+    # TIME-SCOPED, not "any open row ever".
+    #
+    # This used to block a second forecast for a game until the first was
+    # graded. With a 7-day horizon that meant a game was unavailable for a week
+    # even when the new evidence was genuinely new - measured 2026-10-28..11-04,
+    # `record` wrote 1 row/day against a ceiling of 8, with 17 rows parked open.
+    #
+    # A row now stops blocking once it is OLDER THAN THE HORIZON it is judged
+    # on. At that point its window has closed or is about to, so a fresh
+    # forecast for the same game measures a different period rather than
+    # counting the same move twice. Rows still inside their window keep the
+    # original guarantee, which is what the dedup was for: one commentary per
+    # game per period, so a single lucky game cannot inflate the hit rate.
+    horizon = PLANS.get(kind, {}).get("horizon", 7)
+    floor = utcnow() - timedelta(days=horizon)
     q = s.query(Prediction).filter(
         Prediction.kind == kind,
-        Prediction.outcome.is_(None))
+        Prediction.outcome.is_(None),
+        Prediction.made_at > floor)
     if universe_id is not None:
         return q.filter(Prediction.universe_id == universe_id).count() > 0
     return q.filter(Prediction.subject == subject).count() > 0
@@ -480,7 +550,16 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
                 # history that may have been pruned.
                 benchmark=_market_median_ccu(s, utcnow()),
                 criterion=plan["criterion"],
-                threshold_pp=plan.get("threshold_pp", 20.0),
+                # Derived from history, not a round number. `20 pp` has no
+                # meaning until someone measures what 20 pp is worth; p75 does
+                # - it is the bar three quarters of comparable games fail.
+                # Cached per process and computed once per horizon because
+                # excess_samples() walks the whole snapshot matrix.
+                #
+                # Falls back to the old hardcoded 20 only when derive_threshold
+                # reports insufficient history, which is the honest answer
+                # before the first full window exists.
+                threshold_pp=_threshold_for(plan),
                 horizon_days=plan["horizon"],
                 score=c["score"],
                 confidence=c["confidence"],

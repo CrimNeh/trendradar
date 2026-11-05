@@ -157,50 +157,48 @@ def youtube_features(now: pd.Timestamp) -> pd.DataFrame:
     """
     cols = ["universe_id", "yt_videos", "yt_views", "yt_velocity", "yt_age_h",
             "yt_langs", "yt_non_en"]
+    # How far back coverage still counts as evidence about the present. Matches
+    # digest_html.YT_EVIDENCE_DAYS; two months is loose on purpose because the
+    # question is "is this game talked about", not "did it move this week".
+    YT_FEATURE_DAYS = int(os.environ.get("YT_EVIDENCE_DAYS", "60"))
 
+    # AGGREGATED IN SQL - same change and same reasoning as
+    # digest_html.yt_evidence(). This used to pull the whole mention table plus
+    # every mentioned video into Python (49 564 rows, 3.02 MB per call) and
+    # build_features() runs in six processes per tick. GROUP BY keeps the
+    # wire payload at one row per game, and stops it growing when the tables do.
+    #
+    # Windowed on the LATER of `observed` and `published`: a mention counts if
+    # we saw it recently OR the video is recent, because a fresh upload of an
+    # old game is current buzz while a two-month-old video is not.
     with Session() as s:
-        m = s.query(Mention.universe_id, Mention.video_id, Mention.observed,
-                    Mention.lang).all()
-        # Mentioned videos only - see the same change in digest_html.
-        # yt_videos is 38724 rows here and only 15773 of them are ever joined
-        # to a mention; the rest are transferred and dropped. 2.36 MB -> 0.96 MB
-        # per call on Neon (measured 2026-10-29).
-        v = s.execute(text("""
-            select v.video_id, v.views, v.views_per_hour, v.published
-            from yt_videos v
-            where exists (select 1 from mentions m where m.video_id = v.video_id)
-        """)).all()
+        rows = s.execute(text("""
+            select m.universe_id,
+                   count(distinct v.video_id)             as videos,
+                   coalesce(sum(v.views), 0)              as views,
+                   coalesce(sum(v.views_per_hour), 0)     as vph,
+                   count(distinct m.lang)                 as langs,
+                   min(v.published)                       as first_pub,
+                   count(*) filter (where coalesce(m.lang, 'en') <> 'en') as non_en
+            from mentions m
+            join yt_videos v on v.video_id = m.video_id
+            where m.observed > now() - make_interval(days => :days)
+               or v.published > now() - make_interval(days => :days)
+            group by m.universe_id
+        """), {"days": YT_FEATURE_DAYS}).all()
 
-    if not m or not v:
+    if not rows:
         return pd.DataFrame(columns=cols)
 
-    md = pd.DataFrame(m, columns=["universe_id", "video_id", "observed", "lang"])
-    vd = pd.DataFrame(v, columns=["video_id", "views", "vph", "published"])
-    vd["published"] = pd.to_datetime(vd["published"], utc=True)
-    md["observed"] = pd.to_datetime(md["observed"], utc=True)
-
-    vd_last = vd.sort_values("published").drop_duplicates("video_id", keep="last")
-    merged = md.merge(vd_last, on="video_id", how="left")
-
-    week_ago = now - timedelta(days=7)
-    merged = merged[(merged["observed"] >= week_ago) | (merged["published"] >= week_ago)]
-    if merged.empty:
-        return pd.DataFrame(columns=cols)
-
-    g = merged.groupby("universe_id").agg(
-        yt_videos=("video_id", "nunique"),
-        yt_views=("views", "sum"),
-        yt_velocity=("vph", "sum"),
-        yt_first=("published", "min"),
-    ).reset_index()
+    g = pd.DataFrame(rows, columns=["universe_id", "yt_videos", "yt_views",
+                                    "yt_velocity", "yt_langs", "yt_first",
+                                    "yt_non_en"])
+    g["yt_first"] = pd.to_datetime(g["yt_first"], utc=True)
     g["yt_age_h"] = ((now - g["yt_first"]).dt.total_seconds() / 3600).round(1)
-
-    langs = merged.groupby("universe_id")["lang"].agg(
-        lambda x: len({v for v in x if v and not pd.isna(v)}))
-    non_en = merged[merged["lang"].fillna("en") != "en"].groupby("universe_id").size()
-    g["yt_langs"] = g["universe_id"].map(langs).fillna(0).astype(int)
-    g["yt_non_en"] = g["universe_id"].map(non_en).fillna(0).astype(int)
-
+    for c in ("yt_videos", "yt_langs", "yt_non_en"):
+        g[c] = g[c].fillna(0).astype(int)
+    g["yt_views"] = g["yt_views"].fillna(0).astype("int64")
+    g["yt_velocity"] = g["yt_velocity"].fillna(0.0).astype(float)
     return g[cols]
 
 

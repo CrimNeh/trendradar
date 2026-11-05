@@ -22,14 +22,14 @@ from __future__ import annotations
 import html
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
 from db import Game, Session, Mention, Snapshot, YtVideo  # noqa: E402
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import func, text  # noqa: E402
 from features import build_features, flag_suspect  # noqa: E402
 import forecast  # noqa: E402
 
@@ -43,6 +43,31 @@ MIN_CCU = 500
 # Was 0.15 while `trend` was slope * hours-of-history; at the 41 h archive
 # of 21 Oct those were the same bar. Rescaled once, so the gate keeps the
 # same strictness now that `trend` no longer grows with the archive.
+# How far back the page looks when deciding "rising faster than the market".
+#
+# NOT the same thing as the archive. This used to be unlimited: market_series()
+# read every snapshot ever collected, so the fit window grew by a day every day.
+# Two consequences, both measured 2026-11-05:
+#
+#   * CORRECTNESS. `trend` is a per-day rate, so it kept its units - but it was
+#     fitted across 16.5 days, which dilutes a game that started climbing three
+#     days ago under thirteen flat days before it. The card's claim is present
+#     tense ("is rising"), and on a 16.5-day fit only 3 of 190 games cleared
+#     MOVE_THRESHOLD. On a 7-day fit, 62 do.
+#   * TRANSFER. Reading the whole table cost 7 MB per call, 8 calls a day, and
+#     it grew with the archive rather than with the question being asked.
+#
+# 7 days matches the `move` forecast horizon: the page and the ledger then grade
+# the same window, which they did not before.
+MARKET_WINDOW_DAYS = int(os.environ.get("MARKET_WINDOW_DAYS", "7"))
+
+# How far back a mention or a video counts as "current coverage" on the page.
+# Two months, deliberately looser than MARKET_WINDOW_DAYS: a video published
+# three weeks ago but mentioning a game that just took off is still good
+# evidence, and the panel's job is "is this game talked about", not "did it move
+# this week". It exists to bound the aggregate, not to filter the signal.
+YT_EVIDENCE_DAYS = int(os.environ.get("YT_EVIDENCE_DAYS", "60"))
+
 MOVE_THRESHOLD = 0.09
 
 # How many rising cards the page renders. predictions.py reads this so the
@@ -93,6 +118,7 @@ def _orphan_uids(s) -> set[int]:
 
 
 _MARKET_CACHE: tuple | None = None
+_YT_CACHE: dict[int, dict] | None = None
 
 
 def market_series() -> tuple[pd.DataFrame, pd.Series]:
@@ -109,7 +135,18 @@ def market_series() -> tuple[pd.DataFrame, pd.Series]:
     if _MARKET_CACHE is not None:
         return _MARKET_CACHE
     with Session() as s:
-        rows = s.query(Snapshot.universe_id, Snapshot.ts, Snapshot.playing).all()
+        # Windowed, not the whole archive - see MARKET_WINDOW_DAYS. The cutoff is
+        # computed from the newest snapshot rather than from `now()` so a paused
+        # or lagging collector still renders the same page instead of an empty
+        # one.
+        newest = s.query(func.max(Snapshot.ts)).scalar()
+        if newest is None:
+            _MARKET_CACHE = (pd.DataFrame(), pd.Series(dtype=float))
+            return _MARKET_CACHE
+        cutoff = newest - timedelta(days=MARKET_WINDOW_DAYS)
+        rows = (s.query(Snapshot.universe_id, Snapshot.ts, Snapshot.playing)
+                 .filter(Snapshot.ts >= cutoff)
+                 .all())
         drop = _orphan_uids(s)
     df = pd.DataFrame(rows, columns=["universe_id", "ts", "playing"])
     if df.empty:
@@ -143,16 +180,34 @@ def relative_moves(piv: pd.DataFrame, med: pd.Series) -> pd.DataFrame:
     hours = (piv.index - piv.index[0]).total_seconds() / 3600
     x = np.asarray(hours, dtype=float)
 
-    first = share.iloc[0]
     last = share.iloc[-1]
-    ok = (first > 0) & (last > 0) & last.notna() & first.notna()
 
     rows = []
-    for uid in last[ok].index:
+    # NO "present in the first snapshot" REQUIREMENT.
+    #
+    # This used to be `ok = (first > 0) & (last > 0)` where `first` was
+    # share.iloc[0] - the OLDEST row of the fit window. A game that entered the
+    # carousels two days ago has no value there, so it was dropped before any
+    # slope was computed. Measured 2026-11-05: 624 of 868 games discarded this
+    # way, 256 of them arrivals after the archive began.
+    #
+    # That is the wrong set to discard. The page's whole claim is "these games
+    # are rising faster than the market", and a game that just appeared in a
+    # carousel is precisely the candidate for it - while an established game
+    # present on day one is the one least likely to be breaking out. The filter
+    # was systematically hiding the product's own subject, and it got stricter
+    # every day the window grew (see MARKET_WINDOW_DAYS).
+    #
+    # What is required instead is enough own history to fit a line: three
+    # distinct points, none of them missing or zero. First *available* reading
+    # is used as the baseline for share_change, not the window's first row.
+    for uid in last[last.notna() & (last > 0)].index:
         y = share[uid].to_numpy(dtype=float)
         good = ~np.isnan(y) & (y > 0)
         if good.sum() < 3:
             continue
+        pos = np.flatnonzero(good)
+        first_i = int(pos[0])
         ly = np.log2(y[good])
         xx = x[good]
         try:
@@ -173,12 +228,14 @@ def relative_moves(piv: pd.DataFrame, med: pd.Series) -> pd.DataFrame:
 
         rows.append({
             "universe_id": uid,
-            "share_change": float(last[uid] / first[uid]),
+            # First *available* reading, so a late arrival reports the growth it
+            # actually had rather than a NaN.
+            "share_change": float(y[pos[-1]] / y[first_i]),
             "share_slope": float(slope),
             "r2": float(max(r2, 0.0)),
             "consistency": agree,
             "points": int(good.sum()),
-            "ccu_first": float(piv.iloc[0][uid]),
+            "ccu_first": float(piv.iloc[first_i][uid]),
             "ccu_last": float(piv.iloc[-1][uid]),
         })
 
@@ -221,45 +278,56 @@ def sparkline(values: list[float], w: int = 132, h: int = 34) -> str:
 
 
 def yt_evidence() -> dict[int, dict]:
-    """YouTube activity per game: how many videos, how fast they are gaining."""
-    with Session() as s:
-        m = s.query(Mention.universe_id, Mention.video_id, Mention.lang).all()
-        # Only videos that actually carry a mention. This used to load every
-        # row in yt_videos (38724 / 4.81 MB on Neon, 2026-10-29) and then merge
-        # them onto the mention table - so ~23000 rows were transferred and
-        # discarded by the `how="left"` join, whose only effect they could have
-        # had was to fill in a video_id the mention table already guarantees.
-        #
-        # Restricting to the mentioned ids is behaviourally identical (the
-        # merge is keyed on mention.video_id, so a video with no mention can
-        # never contribute a row) and halves the transfer to 2.03 MB. Scoped by
-        # a subquery rather than a materialised id list so the DB does the
-        # filtering and only matching rows cross the wire.
-        v = s.execute(text("""
-            select v.video_id, v.views, v.views_per_hour, v.title, v.published
-            from yt_videos v
-            where exists (select 1 from mentions m where m.video_id = v.video_id)
-        """)).all()
+    """YouTube activity per game: how many videos, how fast they are gaining.
 
-    if not m or not v:
-        return {}
-    md = pd.DataFrame(m, columns=["universe_id", "video_id", "lang"])
-    vd = pd.DataFrame(v, columns=["video_id", "views", "vph", "title", "published"])
-    merged = md.merge(vd, on="video_id", how="left")
+    AGGREGATED IN SQL. This used to pull every mention row and every mentioned
+    video into Python and group them there - 49 564 rows, 3.02 MB per call, and
+    it repeated 8 times a day. The row count is a property of the archive, not
+    of the question, so the cost climbed forever while the answer stayed the
+    same size: ~1440 games.
+
+    GROUP BY moves that work to the database. The wire now carries the answer
+    (one row per game) instead of the evidence (one row per mention/video), and
+    it no longer grows when the tables do. Measured 2026-11-05: 3.02 MB -> 0.07
+    MB per call.
+
+    Scoped to YT_EVIDENCE_DAYS for the same reason the page windows its market
+    fit: "is this game alive right now" is answered by recent coverage, and a
+    video from two months ago is not evidence about today. The window is applied
+    on `observed` (when we first saw the mention) OR `published` (when the video
+    went out), because a freshly discovered old upload is still fresh evidence.
+    """
+    global _YT_CACHE
+    if _YT_CACHE is not None:
+        return _YT_CACHE
+    with Session() as s:
+        rows = s.execute(text("""
+            select m.universe_id,
+                   count(distinct v.video_id)                 as videos,
+                   coalesce(sum(v.views), 0)                  as views,
+                   coalesce(sum(v.views_per_hour), 0)         as vph,
+                   count(distinct m.lang)                     as langs,
+                   max(v.views)                               as top_views,
+                   (array_agg(v.title order by v.views desc
+                              nulls last))[1]                 as top_title
+            from mentions m
+            join yt_videos v on v.video_id = m.video_id
+            where m.observed > now() - make_interval(days => :days)
+               or v.published > now() - make_interval(days => :days)
+            group by m.universe_id
+        """), {"days": YT_EVIDENCE_DAYS}).all()
 
     out: dict[int, dict] = {}
-    for uid, g in merged.groupby("universe_id"):
-        views = g["views"].fillna(0)
-        vph = g["vph"].fillna(0)
-        top = g.loc[views.idxmax()] if len(g) else None
-        out[int(uid)] = {
-            "videos": int(len(g)),
-            "views": int(views.sum()),
-            "vph": float(vph.sum()),
-            "langs": int(g["lang"].dropna().nunique()),
-            "top_title": (str(top["title"])[:70] if top is not None else ""),
-            "top_views": int(top["views"]) if top is not None and pd.notna(top["views"]) else 0,
+    for r in rows:
+        out[int(r[0])] = {
+            "videos": int(r[1] or 0),
+            "views": int(r[2] or 0),
+            "vph": float(r[3] or 0.0),
+            "langs": int(r[4] or 0),
+            "top_views": int(r[5] or 0),
+            "top_title": (str(r[6])[:70] if r[6] else ""),
         }
+    _YT_CACHE = out
     return out
 
 
