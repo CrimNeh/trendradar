@@ -160,8 +160,26 @@ jobs:
         uses: actions/upload-artifact@v6
         if: always()
         with:
+          # TWO files now, and both exist to stop the same read happening
+          # more than once:
+          #
+          #   features_cache.pkl  - build_features(), called by six processes
+          #   pivots_cache.pkl    - _snapshots_pivots(), called by three
+          #                         (record / resolve / score)
+          #
+          # The second was the bigger item: 10 128 kB per call on Neon
+          # 2026-11-11, three calls per run, eight runs a day - 240 MB/day, over
+          # half of total transfer. Processes in one job share the disk, so the
+          # first one to run pays for the read and the rest load the pickle.
+          #
+          # `if-no-files-found: ignore` because either file may legitimately be
+          # absent on a run that wrote no snapshots; that must not fail a job
+          # whose real output (the digest) succeeded.
           name: features-cache-${{ github.run_id }}
-          path: data/features_cache.pkl
+          path: |
+            data/features_cache.pkl
+            data/pivots_cache.pkl
+          if-no-files-found: ignore
           retention-days: 1
 
       # Ship the finished page, not the ingredients.

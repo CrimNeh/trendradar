@@ -33,6 +33,7 @@ import argparse
 import json
 import math
 import os
+import pickle
 import sys
 from datetime import timedelta
 
@@ -40,6 +41,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(__file__))
+from sqlalchemy import func  # noqa: E402
 from db import Prediction, Session, Snapshot, utcnow  # noqa: E402
 
 # Below this a percentage move is noise: 50 -> 60 is +20% and means nothing.
@@ -82,6 +84,59 @@ def _orphan_uids(s) -> set[int]:
             s.query(Game.universe_id).filter(Game.origin == "orphan").all()}
 
 
+_PIVOT_FILE = os.path.join(os.path.dirname(__file__), "..", "data",
+                           "pivots_cache.pkl")
+
+
+def _pivot_cache_key() -> tuple:
+    """Invalidation key for the pivot disk cache.
+
+    Same shape as features._cache_key(): newest timestamp, highest row id and
+    row count. max(id) alone would miss a run that only wrote rows older than
+    the newest tick; max(ts) alone would miss a late backfill. The count is the
+    tie-breaker for a delete-plus-insert that leaves both unchanged.
+
+    Deliberately does NOT hash the window constant: changing PIVOT_MIN_DAYS is
+    a code change, and a code change ships with a commit that the CI reads
+    fresh anyway. Baking it in would just churn the file.
+    """
+    with Session() as s:
+        newest = s.query(func.max(Snapshot.ts)).scalar()
+        top_id = s.query(func.max(Snapshot.id)).scalar()
+        cnt = s.query(func.count(Snapshot.id)).scalar()
+    return (str(newest), int(top_id or 0), int(cnt or 0))
+
+
+def _pivot_cache_load(key: tuple) -> tuple | None:
+    try:
+        if os.path.exists(_PIVOT_FILE):
+            with open(_PIVOT_FILE, "rb") as fh:
+                blob = pickle.load(fh)
+            if blob.get("key") == key:
+                piv = blob.get("piv")
+                med = blob.get("med")
+                if isinstance(piv, pd.DataFrame) and isinstance(med, pd.Series):
+                    return (piv, med)
+    except Exception:
+        pass
+    return None
+
+
+def _pivot_cache_store(key: tuple, val: tuple) -> None:
+    try:
+        os.makedirs(os.path.dirname(_PIVOT_FILE), exist_ok=True)
+        with open(_PIVOT_FILE, "wb") as fh:
+            pickle.dump({"key": key, "piv": val[0], "med": val[1]}, fh,
+                        protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+
+
+# Floor for the pivot window, so a short PLANS table cannot shrink it below
+# something excess_samples() needs. 40 days covers the longest horizon (21)
+# plus a 14-day lookback, with slack for missed ticks.
+PIVOT_MIN_DAYS = int(os.environ.get("PIVOT_MIN_DAYS", "40"))
+
 _PIVOT_CACHE: tuple | None = None
 
 
@@ -99,8 +154,51 @@ def _snapshots_pivots() -> tuple[pd.DataFrame, pd.Series]:
     global _PIVOT_CACHE
     if _PIVOT_CACHE is not None:
         return _PIVOT_CACHE
+
+    # DISK CACHE, not just process memory, and this is the single biggest
+    # transfer item on the account.
+    #
+    # `record`, `resolve` and `score` are three SEPARATE processes in one
+    # workflow job, so the in-memory cache below never helps them share work -
+    # each starts cold and re-reads the matrix. Measured 2026-11-11: 10 128 kB
+    # per call, three calls per run, eight runs a day = 240 MB/day, which was
+    # over half of everything Neon served.
+    #
+    # Keyed on the same (newest ts, max id, row count) triple features.py uses,
+    # so a new collection tick invalidates it and a stale matrix cannot reach a
+    # verdict. Written to data/ and shipped between jobs the same way
+    # features_cache.pkl is.
+    #
+    # Any cache failure recomputes. A cache that can break a grading run is
+    # worse than no cache: the whole point is that losing it is cheap.
+    key = _pivot_cache_key()
+    cached = _pivot_cache_load(key)
+    if cached is not None:
+        _PIVOT_CACHE = cached
+        return _PIVOT_CACHE
+
     with Session() as s:
-        rows = s.query(Snapshot.universe_id, Snapshot.ts, Snapshot.playing).all()
+        # WINDOWED, like digest_html.market_series(). This read the whole
+        # table - 9 472 kB per call on Neon 2026-11-11, 8 calls a day, and it
+        # grew with the archive rather than with the question. The window has
+        # to be long enough to hold the longest horizon PLUS the lookback that
+        # `derive_threshold` fits its trend over, otherwise excess_samples()
+        # silently loses the oldest window instead of erroring.
+        #
+        # MAX_HORIZON_DAYS (21, the `anime` plan) + 14 days of lookback gives
+        # 35; rounded to 40 for slack. Derived from PLANS rather than written
+        # as a literal so adding a longer horizon cannot quietly truncate the
+        # sample.
+        span = max(p["horizon"] for p in PLANS.values()) + 14
+        span = max(span, PIVOT_MIN_DAYS)
+        newest = s.query(func.max(Snapshot.ts)).scalar()
+        if newest is None:
+            _PIVOT_CACHE = (pd.DataFrame(), pd.Series(dtype=float))
+            return _PIVOT_CACHE
+        cutoff = newest - timedelta(days=span)
+        rows = (s.query(Snapshot.universe_id, Snapshot.ts, Snapshot.playing)
+                 .filter(Snapshot.ts >= cutoff)
+                 .all())
         drop = _orphan_uids(s)
     df = pd.DataFrame(rows, columns=["universe_id", "ts", "playing"])
     if df.empty:
@@ -115,6 +213,7 @@ def _snapshots_pivots() -> tuple[pd.DataFrame, pd.Series]:
     piv = (df.pivot_table(index="ts", columns="universe_id",
                           values="playing", aggfunc="last").sort_index())
     _PIVOT_CACHE = (piv, piv.median(axis=1))
+    _pivot_cache_store(key, _PIVOT_CACHE)
     return _PIVOT_CACHE
 
 
@@ -237,6 +336,21 @@ def derive_threshold(percentile: int = 75, horizon_days: float = 7,
 #       the exact mix of fixes present differs slightly within version 2 itself
 #       (e.g. the benchmark fix landed 2026-10-28), which is a known gap - see
 #       CHANGELOG below rather than assume every v2 row is judged identically.
+#   4 = 2026-11-11. One change, deliberately isolated so it can be judged on
+#       its own: the candidate sort is DESCENDING trend again (biggest movers),
+#       reverting the 2026-10-28 "proximity to the bar" experiment.
+#
+#       Measured before flipping (fixed panel, honest out-of-sample, all games
+#       >500 CCU, 7-day forward, n=10 545): top-8 by momentum 36.2% hit against
+#       a 19.4% base - +16.8 pp. The proximity sort had been selecting the
+#       WEAKEST qualifying movers on the strength of a Spearman measured on
+#       n=24, taken while relative_moves() was dropping 256 of 868 games.
+#
+#       v3 stays on the record as its own version: 49 graded rows, 14.3% hit
+#       against a 24.4% base rate, i.e. WORSE than random. That result was
+#       produced by the inverted sort, so it is the control this version is
+#       measured against, not a verdict on momentum.
+#
 #   3 = 2026-11-05 onward. Three changes at once, which is why the version
 #       moved: `move` horizon 7 -> 3 days, the pp bar taken from
 #       derive_threshold() instead of a hardcoded 20, and deduplication made
@@ -250,7 +364,7 @@ def derive_threshold(percentile: int = 75, horizon_days: float = 7,
 #       fit window - so v2 graded a pool of 244 games instead of 766 and fitted
 #       `trend` across 16 days instead of 7. Both are fixed as of this version.
 #       Treat v2 numbers as "measured under a defect", not as "proven wrong".
-CURRENT_RULESET_VERSION = 3
+CURRENT_RULESET_VERSION = 4
 
 # How each kind of forecast is judged. Deliberately blunt: a percentage move.
 # Anything softer ("became popular") cannot be scored, and a soft criterion is
@@ -431,30 +545,39 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
         # more than that would put games into the sample that nobody was shown.
         import digest_html as D
 
-        # PROVISIONAL, set 2026-10-28 after the first 24 forecasts settled.
-        # The original rule picked the LARGEST moves first, on the assumption
-        # that a bigger move is a stronger signal. Measured on those 24:
-        # Spearman(trend, hit) = -0.36 - the biggest movers missed more than
-        # they hit (46% hit rate below the trend median vs 8% above it). r2
-        # (how cleanly the growth line fits) pointed the other way, weakly
-        # (+0.17). Read together: a game at the top of a spike scores a huge
-        # trend number right when it is least likely to still be climbing by
-        # the time the horizon closes, which is the "launch spike, then
-        # reversion" pattern the external audit flagged and n=24 now shows
-        # directly on this project's own data - not a reason to trust it
-        # blindly, but a reason to stop selecting for the opposite of what
-        # the first week measured.
+        # DESCENDING trend - the biggest movers. This REVERTS the 2026-10-28
+        # "proximity to the bar" sort, and the reversal is backed by the
+        # largest test run on this project so far, not by a hunch.
         #
-        # So: rank candidates by PROXIMITY to the qualifying bar (ascending
-        # trend) instead of by the size of the move, with r2 descending as
-        # the tie-break. This changes what gets RECORDED as a forecast, not
-        # what the digest page shows - the page still lists the biggest
-        # movers, which is a legitimate "what happened" view independent of
-        # whether that is a good forecast ranking.
+        # Why the proximity sort was wrong. It ranked candidates by how close
+        # they sat ABOVE MOVE_THRESHOLD, i.e. it deliberately picked the
+        # WEAKEST qualifying movers. The reasoning at the time was a
+        # Spearman(trend, hit) = -0.36 measured on n=24, which looked like
+        # "spikes revert". Two things were wrong with that reading: n=24 is
+        # far too small to detect a monotone effect, and the sample was drawn
+        # while relative_moves() was itself broken (it required a game to be
+        # present on the FIRST row of the fit window, which discarded 256 of
+        # 868 games - disproportionately the new arrivals, which are exactly
+        # the population the sort is about).
         #
-        # n=24 is small. Re-check this sort once week 2 settles (~2026-11-04)
-        # and revert to descending if the direction does not hold.
-        rows = rows.sort_values(["trend", "r2"], ascending=[True, False])
+        # Re-measured 2026-11-11 on a fixed panel, honest out-of-sample, all
+        # games above 500 CCU, 7-day forward:
+        #
+        #   n = 10 545, base hit rate 19.4%
+        #   top-8 by trend (descending) : 36.2% hit, median excess +8.0 pp
+        #   bottom-8 by trend           : 25.8% hit, median excess -3.4 pp
+        #
+        # Momentum holds and is worth ~17 pp over the base rate. The
+        # proximity sort was selecting into the part of the distribution with
+        # the least follow-through: a game at +9.1% against a +9.0% bar is a
+        # single noisy tick, while one at +300% is a launch.
+        #
+        # This ALSO removes a real inconsistency. The page renders
+        # RISING_CARDS games ordered by trend descending; the ledger sorted
+        # ascending and recorded a different eight. The score was grading a
+        # list the reader was never shown - the exact defect digest_selection()
+        # was written to prevent, reintroduced one layer down by the sort.
+        rows = rows.sort_values(["trend", "r2"], ascending=[False, False])
         rows = rows.head(min(top_n, D.RISING_CARDS))
 
         # The digest already drops games below its own MIN_CCU inside
@@ -537,11 +660,17 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
                     no_momentum += 1
                     continue
 
+            # Resolved once per row, used by both the claim text and the stored
+            # bar. Before this, the claim said ">=20 пп" while threshold_pp held
+            # the derived 18.5 - the row's own description contradicted its
+            # grading rule, and only one of the two was true.
+            _bar = _threshold_for(plan)
+
             s.add(Prediction(
                 kind=kind,
                 universe_id=uid,
                 subject=subject,
-                claim=(f"обгонит рынок на ≥20 пп за {plan['horizon']} дн "
+                claim=(f"обгонит рынок на ≥{_bar:.1f} пп за {plan['horizon']} дн "
                        f"(старт {base:.0f})"),
                 metric=plan["metric"],
                 baseline=base,
@@ -559,7 +688,7 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
                 # Falls back to the old hardcoded 20 only when derive_threshold
                 # reports insufficient history, which is the honest answer
                 # before the first full window exists.
-                threshold_pp=_threshold_for(plan),
+                threshold_pp=_bar,
                 horizon_days=plan["horizon"],
                 score=c["score"],
                 confidence=c["confidence"],
@@ -599,7 +728,6 @@ def _market_median_ccu(s, at) -> float | None:
     value a human can read next to the row. NOT used to judge "beat the
     market" claims any more - see `_market_change` for that.
     """
-    from sqlalchemy import func
     ts = (s.query(func.max(Snapshot.ts))
            .filter(Snapshot.ts <= at).scalar())
     if ts is None:
