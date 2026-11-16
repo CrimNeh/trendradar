@@ -91,20 +91,29 @@ _PIVOT_FILE = os.path.join(os.path.dirname(__file__), "..", "data",
 def _pivot_cache_key() -> tuple:
     """Invalidation key for the pivot disk cache.
 
-    Same shape as features._cache_key(): newest timestamp, highest row id and
-    row count. max(id) alone would miss a run that only wrote rows older than
-    the newest tick; max(ts) alone would miss a late backfill. The count is the
-    tie-breaker for a delete-plus-insert that leaves both unchanged.
+    NO COUNT(*). The first version added `count(id)` as a tie-breaker for a
+    delete-plus-insert that leaves max(id) and max(ts) unchanged - a case that
+    cannot happen here, because `snapshots` is INSERT-only (verified: n_tup_upd
+    = 0). It cost 11 424 kB per call, because COUNT over the whole table is a
+    Seq Scan no index can answer, against 40 kB for max(id) and 288 kB for
+    max(ts). Measured 2026-11-16 on this database.
+
+    That single term was the largest read on the account: two processes call
+    this per run (record, resolve), so 23 MB per run for a cache key - more
+    than the cached value itself. A cache key must never cost more than the
+    thing it guards.
+
+    (max(id), max(ts)) is sufficient: an INSERT moves one of them, and nothing
+    else modifies this table.
 
     Deliberately does NOT hash the window constant: changing PIVOT_MIN_DAYS is
     a code change, and a code change ships with a commit that the CI reads
     fresh anyway. Baking it in would just churn the file.
     """
     with Session() as s:
-        newest = s.query(func.max(Snapshot.ts)).scalar()
-        top_id = s.query(func.max(Snapshot.id)).scalar()
-        cnt = s.query(func.count(Snapshot.id)).scalar()
-    return (str(newest), int(top_id or 0), int(cnt or 0))
+        row = s.query(func.max(Snapshot.ts), func.max(Snapshot.id)).first()
+    newest, top_id = (row[0], row[1]) if row else (None, None)
+    return (str(newest), int(top_id or 0))
 
 
 def _pivot_cache_load(key: tuple) -> tuple | None:
