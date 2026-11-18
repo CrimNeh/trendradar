@@ -75,6 +75,22 @@ MOVE_THRESHOLD = 0.09
 # rendered 8, which put two unevaluated games into the hit-rate sample.
 RISING_CARDS = 8
 
+# A candidate is rejected if its current CCU sits above this fraction of its own
+# recent high. 1.0 would accept everything; 0.0 would accept nothing.
+#
+# The feature and its evidence are documented in relative_moves(). Short
+# version, measured 2026-11-17 on 27 024 fixed-panel observations, 3 days
+# forward: games at 0.0-0.26 of their high hit 31.5% of the time, games at
+# 0.82-1.00 hit 13.7%. Within the qualifying set the cutoff at 0.7 costs 17% of
+# candidates and gains about 6 pp of hit rate; 0.5 is stronger (+12 pp) but
+# halves the pool, which matters because the ledger already dedupes to a few
+# rows a day.
+#
+# Deliberately NOT a hard rule about the market: it is applied to the game's own
+# peak, and it was checked to hold inside every hour of the day (8 of 8), so it
+# is not a disguised time-of-day filter.
+FROM_PEAK_MAX = float(os.environ.get("FROM_PEAK_MAX", "0.7"))
+
 
 def _esc(x) -> str:
     return html.escape(str(x if x is not None else ""))
@@ -182,6 +198,12 @@ def relative_moves(piv: pd.DataFrame, med: pd.Series) -> pd.DataFrame:
 
     last = share.iloc[-1]
 
+    # Peak CCU per game over the same window, for `from_peak` below. Computed
+    # on raw playing, not on share: the question is "how far has this game
+    # fallen from its own high", which is a property of the game, and dividing
+    # by the market median would fold the daily cycle back in.
+    peak = piv.max(axis=0, skipna=True)
+
     rows = []
     # NO "present in the first snapshot" REQUIREMENT.
     #
@@ -237,6 +259,40 @@ def relative_moves(piv: pd.DataFrame, med: pd.Series) -> pd.DataFrame:
             "points": int(good.sum()),
             "ccu_first": float(piv.iloc[first_i][uid]),
             "ccu_last": float(piv.iloc[-1][uid]),
+            # How far the current reading sits below the window's high.
+            # 1.0 = at the peak, 0.3 = a third of it.
+            #
+            # MEASURED 2026-11-17, and this is the strongest single feature
+            # found on this project so far (n=27 024, 3-day forward, all games
+            # above 500 CCU, fixed panel):
+            #
+            #   from_peak 0.01-0.26 : 31.5% hit, median absolute growth +10.9%
+            #   from_peak 0.47-0.52 : 19.5% hit, median growth  -2.2%
+            #   from_peak 0.82-1.00 : 13.7% hit, median growth -26.1%
+            #
+            # A 2.3x spread across the distribution, and the direction is the
+            # opposite of the obvious reading of "momentum": a game sitting AT
+            # its high is the worst candidate, one that fell to a third of its
+            # high and is climbing again is the best. The interpretation is
+            # that a peak marks the end of a launch spike, so "at the peak"
+            # means "about to revert", while a recovery has already absorbed
+            # its reversion.
+            #
+            # Checked for two confounds before trusting it:
+            #
+            #   * TIME OF DAY. The market's own from_peak ranges 0.50 at 07:00
+            #     to 0.88 at 13:00 UTC, so a naive version of this feature is
+            #     partly just "what time is it". Split by hour, the effect
+            #     HOLDS INSIDE EVERY HOUR (8 of 8, median +16.2 pp), so it is a
+            #     property of the game rather than of the clock. The raw
+            #     version is kept for that reason - normalising by the market's
+            #     from_peak made it *worse* (31.7% vs 37.1% at the same
+            #     cutoff), which says the market-wide daily cycle is not the
+            #     mechanism.
+            #   * RETURN CHASING. Absolute growth is monotone in from_peak, not
+            #     just excess, so this is not the market median leaking in.
+            "from_peak": (float(piv.iloc[-1][uid] / peak[uid])
+                          if peak.get(uid, 0) and peak[uid] > 0 else 1.0),
         })
 
     out = pd.DataFrame(rows)
@@ -531,7 +587,12 @@ def render(f: pd.DataFrame, piv: pd.DataFrame, med: pd.Series,
     market_first = float(med.iloc[0]) if len(med) else 0
 
     if len(rows):
-        rising = rows[(rows["trend"] >= MOVE_THRESHOLD) & (rows["r2"] >= 0.25)]
+        ok = ((rows["trend"] >= MOVE_THRESHOLD) & (rows["r2"] >= 0.25))
+        if "from_peak" in rows.columns:
+            # Not filtered when the column is absent, so an older pickle or a
+            # partial frame still renders rather than silently showing nothing.
+            ok &= rows["from_peak"].fillna(1.0) <= FROM_PEAK_MAX
+        rising = rows[ok]
         falling = rows[(rows["trend"] <= -MOVE_THRESHOLD) & (rows["r2"] >= 0.25)]
         falling = falling.sort_values("trend")
     else:

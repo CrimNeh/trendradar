@@ -345,6 +345,25 @@ def derive_threshold(percentile: int = 75, horizon_days: float = 7,
 #       the exact mix of fixes present differs slightly within version 2 itself
 #       (e.g. the benchmark fix landed 2026-10-28), which is a known gap - see
 #       CHANGELOG below rather than assume every v2 row is judged identically.
+#   5 = 2026-11-18. One feature added: `from_peak`, the game's current CCU as a
+#       fraction of its own high over the fit window, with a cutoff at
+#       FROM_PEAK_MAX (0.7). Candidates sitting at their peak are dropped.
+#
+#       Measured 2026-11-17 before adopting (fixed panel, 3-day forward, all
+#       games above 500 CCU, n=27 024): 31.5% hit for games at 0.01-0.26 of
+#       their high against 13.7% at 0.82-1.00. Within the qualifying set,
+#       trend alone 24.9% -> trend with from_peak<0.7 31.0%.
+#
+#       Verified as a property of the game rather than of the clock: the
+#       market's own from_peak swings 0.50 (07:00) to 0.88 (13:00) UTC, but the
+#       effect holds inside EVERY hour separately (8 of 8, median +16.2 pp).
+#       Also monotone in absolute growth, not only in excess, so it is not the
+#       market median leaking in.
+#
+#       `_still_open` and the rest of the rule set are unchanged, so a v5 row is
+#       directly comparable to v4 - the only difference is which games got
+#       picked.
+#
 #   4 = 2026-11-11. One change, deliberately isolated so it can be judged on
 #       its own: the candidate sort is DESCENDING trend again (biggest movers),
 #       reverting the 2026-10-28 "proximity to the bar" experiment.
@@ -373,7 +392,7 @@ def derive_threshold(percentile: int = 75, horizon_days: float = 7,
 #       fit window - so v2 graded a pool of 244 games instead of 766 and fitted
 #       `trend` across 16 days instead of 7. Both are fixed as of this version.
 #       Treat v2 numbers as "measured under a defect", not as "proven wrong".
-CURRENT_RULESET_VERSION = 4
+CURRENT_RULESET_VERSION = 5
 
 # How each kind of forecast is judged. Deliberately blunt: a percentage move.
 # Anything softer ("became popular") cannot be scored, and a soft criterion is
@@ -586,6 +605,14 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
         # ascending and recorded a different eight. The score was grading a
         # list the reader was never shown - the exact defect digest_selection()
         # was written to prevent, reintroduced one layer down by the sort.
+        # The page applies FROM_PEAK_MAX before it picks cards, so the ledger
+        # must apply it too - otherwise the score grades games the reader was
+        # never shown, which is the exact defect digest_selection() exists to
+        # prevent. Read from the module rather than duplicated.
+        peak_max = getattr(D, "FROM_PEAK_MAX", 1.0)
+        if "from_peak" in rows.columns:
+            rows = rows[rows["from_peak"].fillna(1.0) <= peak_max]
+
         rows = rows.sort_values(["trend", "r2"], ascending=[False, False])
         rows = rows.head(min(top_n, D.RISING_CARDS))
 
@@ -635,6 +662,24 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
             "cohort_rank": r.get("cohort_rank"),
         } for r in f.nlargest(top_n, "cohort_rank").to_dict("records")]
 
+    # Resolve the bar ONCE, before the loop, and only if there is anything to
+    # record.
+    #
+    # `_threshold_for` is the only thing that builds the snapshot matrix in this
+    # process (via derive_threshold -> excess_samples -> _snapshots_pivots). It
+    # used to be called per candidate inside the loop, which meant two things:
+    # every candidate after the first paid for a dict lookup it did not need,
+    # and - the real problem - on a run where EVERY candidate was deduped away
+    # the matrix was never built, so `pivots_cache.pkl` was never written and
+    # `resolve` (which does not use the threshold at all) had nothing to load.
+    # Measured 2026-11-17: the artefact was 194 kB, i.e. features only, on every
+    # run. Hoisting it here makes the cache exist on any run that records at
+    # all, and costs nothing on the runs that do not.
+    #
+    # Still skipped entirely when `candidates` is empty, so a quiet tick does
+    # not pay 2.7 s and 2 MB to compute a number it will not use.
+    _BAR = _threshold_for(plan) if candidates else None
+
     made = skipped = no_momentum = 0
     with Session() as s:
         for c in candidates:
@@ -673,7 +718,7 @@ def record_from_features(top_n: int = 10, kind: str = "move") -> dict:
             # bar. Before this, the claim said ">=20 пп" while threshold_pp held
             # the derived 18.5 - the row's own description contradicted its
             # grading rule, and only one of the two was true.
-            _bar = _threshold_for(plan)
+            _bar = _BAR
 
             s.add(Prediction(
                 kind=kind,

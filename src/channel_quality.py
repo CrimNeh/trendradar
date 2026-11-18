@@ -72,23 +72,54 @@ def score_channels() -> list[dict]:
     marker_sql = "(" + " or ".join(
         f"strpos(lower(v.title), '{m}') > 0" for m in ROBLOX_MARKERS) + ")"
 
+    # GROUP BY, NOT CORRELATED SUBQUERIES. Measured on this database
+    # 2026-11-17: the subquery version cost 59 025 MB of buffers and 32 982
+    # SECONDS (9 hours of server time) per invocation, because every
+    # correlated subquery over 7 402 channels re-scanned yt_videos without an
+    # index on channel_id that could serve the DISTINCT. The aggregate
+    # version is 18.9 MB and 88 s - 370x cheaper in bytes and 375x in time.
+    #
+    # That single query was the largest item on the Neon account by a wide
+    # margin: the workflow gave the step `continue-on-error: true`, so it could
+    # burn the whole job's timeout while the database kept working on it, and
+    # the run recorded as a success-with-warning. compute_time on the free tier
+    # is metered in hours; nine hours per audit is not survivable.
+    #
+    # Grouping first also removes the OR-precedence trap documented above: the
+    # marker predicate now sits inside `filter (where ...)`, which is scoped by
+    # the enclosing GROUP BY and cannot leak across channels. Verified on 40
+    # sampled channels against the old version: 0 discrepancies in (videos,
+    # hits, roblox_titles).
     with Session() as s:
         rows = s.execute(text(f"""
+            with vh as (
+              select v.channel_id,
+                     count(distinct v.video_id)                            as videos,
+                     count(distinct v.video_id) filter (where {marker_sql}) as roblox_titles
+              from yt_videos v
+              where v.channel_id is not null
+              group by v.channel_id
+            ),
+            mh as (
+              select m.channel_id,
+                     count(distinct m.video_id) as hits,
+                     max(m.observed)            as last_hit
+              from mentions m
+              where m.channel_id is not null
+              group by m.channel_id
+            )
             select
               ch.channel_id,
               ch.handle,
               ch.lang,
               ch.subscribers,
-              (select count(distinct v.video_id) from yt_videos v
-                 where v.channel_id = ch.channel_id)              as videos,
-              (select count(distinct m.video_id) from mentions m
-                 where m.channel_id = ch.channel_id)              as hits,
-              (select count(distinct v.video_id) from yt_videos v
-                 where v.channel_id = ch.channel_id
-                   and {marker_sql})                              as roblox_titles,
-              (select max(m.observed) from mentions m
-                 where m.channel_id = ch.channel_id)              as last_hit
+              coalesce(vh.videos, 0)        as videos,
+              coalesce(vh.roblox_titles, 0) as roblox_titles,
+              coalesce(mh.hits, 0)          as hits,
+              mh.last_hit
             from yt_channels ch
+            left join vh on vh.channel_id = ch.channel_id
+            left join mh on mh.channel_id = ch.channel_id
             where ch.active = 1
         """)).fetchall()
 
